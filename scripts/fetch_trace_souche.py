@@ -561,7 +561,7 @@ def main():
                         "detail": {"sql": None}
                     })
 
-            # Write SQL details output
+            # Write SQL details output (JSON)
             sql_detail_file = os.path.join(args.output_dir, f"trace_{args.trace_id}_{current_time}_sql_details.json")
             sql_detail_output = {
                 "summary": {
