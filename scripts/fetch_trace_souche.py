@@ -1,3 +1,6 @@
+
+
+
 #!/usr/bin/env python3
 """
 Fetch trace logs from Souche trace backend.
@@ -10,10 +13,16 @@ import sys
 from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
+import re
 
 import urllib.request
 import urllib.error
 import ssl
+
+try:
+    import graphviz
+except ImportError:
+    graphviz = None
 
 
 class TraceFetcher:
@@ -215,16 +224,16 @@ class TraceFetcher:
 
         # Get SQL template - in this API it's in 'path' field
         sql_template = (data.get("path") or
-                       data.get("sql") or 
-                       data.get("sqlText") or 
+                       data.get("sql") or
+                       data.get("sqlText") or
                        data.get("sqlStatement") or
                        data.get("statement") or
                        data.get("query"))
 
         # Get params - in this API they might be in 'extparams'
         params = (data.get("extparams") or
-                 data.get("params") or 
-                 data.get("parameters") or 
+                 data.get("params") or
+                 data.get("parameters") or
                  data.get("args"))
 
         if not sql_template:
@@ -244,7 +253,7 @@ class TraceFetcher:
                 import json
                 try:
                     parsed_params = json.loads(params)
-                    
+
                     if isinstance(parsed_params, dict):
                         # Check for sqlParams field which contains param[0]=value format
                         if "sqlParams" in parsed_params:
@@ -276,20 +285,20 @@ class TraceFetcher:
                                                 param_dict[int(idx)] = num_val
                                         except ValueError:
                                             param_dict[int(idx)] = val
-                                
+
                                 # Convert to list in order
                                 max_idx = max(param_dict.keys())
                                 param_list = []
                                 for i in range(max_idx + 1):
                                     param_list.append(param_dict.get(i))
                                 params = param_list
-                                
+
                                 # Use dbSql as template if available, otherwise use path
                                 if "dbSql" in parsed_params:
                                     sql_template = parsed_params["dbSql"]
                                     # Clean up SQL template (remove newlines and extra whitespace)
                                     sql_template = " ".join(sql_template.split())
-                        
+
                         # First try to get actual SQL from actualSqlList
                         elif "actualSqlList" in parsed_params and isinstance(parsed_params["actualSqlList"], str):
                             try:
@@ -297,24 +306,24 @@ class TraceFetcher:
                                 if isinstance(actual_sql_list, list) and len(actual_sql_list) > 0:
                                     first_sql = actual_sql_list[0]
                                     actual_sql = first_sql.get("sql", "")
-                                    
+
                                     if actual_sql and len(actual_sql) >= len(sql_template) * 0.9:
                                         return actual_sql
-                                    
+
                                     # Try to extract params from actual_sql
                                     extracted_params = TraceFetcher._extract_params_from_actual_sql(actual_sql)
                                     if extracted_params:
                                         params = extracted_params
                             except json.JSONDecodeError:
                                 pass
-                        
+
                         # If we have logicSql and no params extracted, use logicSql
                         if "logicSql" in parsed_params and not isinstance(params, list):
                             logic_sql = parsed_params["logicSql"]
                             # Remove newlines and extra whitespace
                             logic_sql = " ".join(logic_sql.split())
                             return logic_sql
-                            
+
                         if not isinstance(params, list):
                             params = parsed_params
                     elif isinstance(parsed_params, list):
@@ -384,6 +393,281 @@ class TraceFetcher:
         except Exception:
             # If formatting fails, return original SQL
             return sql_template
+
+    @staticmethod
+    def _build_span_tree(spans_data, root_span_id=None):
+        """Build a tree representation from span data.
+
+        Args:
+            spans_data: List of spans from trace data
+            root_span_id: ID of the root span (if None, find spans without parents)
+
+        Returns:
+            Tree structure of spans
+        """
+        # Create a mapping of spans by their IDs
+        spans_by_id = {}
+        for span in spans_data:
+            span_id = span.get("spanId", "unknown")
+            spans_by_id[span_id] = span
+
+        # Helper function to recursively find children
+        def find_children(parent_id):
+            children = []
+            for span_id, span in spans_by_id.items():
+                if span.get("parentId") == parent_id:
+                    child_node = {
+                        "span": span,
+                        "children": find_children(span_id)
+                    }
+                    children.append(child_node)
+            return children
+
+        # Find root span(s) - spans with no parent or parent not in our dataset
+        roots = []
+        for span_id, span in spans_by_id.items():
+            parent_id = span.get("parentId")
+            if not parent_id or parent_id not in spans_by_id:
+                root_node = {
+                    "span": span,
+                    "children": find_children(span_id)
+                }
+                roots.append(root_node)
+
+        return roots
+
+    @staticmethod
+    def _print_span_tree(tree_node, depth=0, prefix="", is_last=True):
+        """Print the span tree in a visual format.
+
+        Args:
+            tree_node: Node in the tree to print
+            depth: Current depth in the tree
+            prefix: Prefix to use for current level
+            is_last: Whether this is the last child at this level
+        """
+        if depth == 0:
+            # Root level
+            span = tree_node["span"]
+            operation_name = span.get("operationName", "Unknown")
+            service_name = span.get("serviceName", "Unknown")
+            duration = span.get("duration", 0)
+            print(f"{operation_name} ({service_name}) [{duration}us]")
+            for i, child in enumerate(tree_node["children"]):
+                is_last_child = (i == len(tree_node["children"]) - 1)
+                TraceFetcher._print_span_tree(child, depth + 1, "", is_last_child)
+        else:
+            # Child levels
+            span = tree_node["span"]
+            operation_name = span.get("operationName", "Unknown")
+            service_name = span.get("serviceName", "Unknown")
+            duration = span.get("duration", 0)
+
+            # Draw tree lines
+            if is_last:
+                print("{}L-- {} ({}) [{}us]".format(prefix, operation_name, service_name, duration))
+                new_prefix = prefix + "    "
+            else:
+                print("{}+-- {} ({}) [{}us]".format(prefix, operation_name, service_name, duration))
+                new_prefix = prefix + "|   "
+
+            # Print children
+            for i, child in enumerate(tree_node["children"]):
+                is_last_child = (i == len(tree_node["children"]) - 1)
+                TraceFetcher._print_span_tree(child, depth + 1, new_prefix, is_last_child)
+
+    @staticmethod
+    def _generate_text_call_graph(trace_data):
+        """Generate a text-based call graph from the trace data.
+
+        Args:
+            trace_data: The full trace data from API
+        """
+        def extract_spans_from_log_tree(data, spans=None):
+            """Extract spans from logTreeVOList format."""
+            if spans is None:
+                spans = []
+
+            def traverse_nodes(nodes, parent_seq=None):
+                if not nodes:
+                    return
+
+                for node in nodes:
+                    # Create a span-like object from the log tree node
+                    span = {
+                        "spanId": node.get("rid"),
+                        "parentId": parent_seq,
+                        "operationName": node.get("path", "Unknown"),
+                        "serviceName": node.get("app", "Unknown"),
+                        "duration": node.get("cost", 0),
+                        "type": node.get("type", "Unknown"),
+                        "seq": node.get("seq", ""),  # Store the sequence for parent-child relationship
+                        "env": node.get("env", ""),
+                        "errtag": node.get("errtag", ""),
+                        "time": node.get("time", "")
+                    }
+                    spans.append(span)
+
+                    # Process children if they exist
+                    children = node.get("children", [])
+                    if children:
+                        traverse_nodes(children, node.get("seq"))
+
+            # Handle the top level of the log tree
+            if isinstance(data, dict) and "data" in data and "logTreeVOList" in data["data"]:
+                log_tree_list = data["data"]["logTreeVOList"]
+                if log_tree_list:
+                    traverse_nodes(log_tree_list)
+
+            return spans
+
+        # Extract spans from the trace data
+        spans = extract_spans_from_log_tree(trace_data)
+
+        if not spans:
+            print("No spans found in trace data")
+            return
+
+        print("Found {} spans in trace data".format(len(spans)))
+
+        # Build a mapping of sequences to spans for building the tree
+        span_map = {}
+        for span in spans:
+            seq = span["seq"]  # Use sequence for parent-child relationships
+            if seq:
+                span_map[seq] = span
+
+        # Find root spans (those without parents or parents not in the dataset)
+        root_spans = []
+        for span in spans:
+            parent_id = span["parentId"]
+            if not parent_id or parent_id not in span_map:
+                root_spans.append(span)
+
+        # Helper function to print the tree
+        def print_tree(spans_list, prefix="", is_last=True):
+            for i, span in enumerate(spans_list):
+                is_last_item = (i == len(spans_list) - 1)
+
+                # Find children of this span
+                children = []
+                for s in spans:
+                    if s["parentId"] == span["seq"]:  # Match by sequence
+                        children.append(s)
+
+                # Print current span
+                if is_last_item:
+                    print("{}L-- {} ({}) [{}us] (type: {})".format(
+                        prefix,
+                        span["operationName"],
+                        span["serviceName"],
+                        span["duration"],
+                        span["type"]
+                    ))
+                    new_prefix = prefix + "    "
+                else:
+                    print("{}+-- {} ({}) [{}us] (type: {})".format(
+                        prefix,
+                        span["operationName"],
+                        span["serviceName"],
+                        span["duration"],
+                        span["type"]
+                    ))
+                    new_prefix = prefix + "|   "
+
+                # Recursively print children
+                if children:
+                    print_tree(children, new_prefix, True)
+
+        # Print the tree starting from root spans
+        print_tree(root_spans)
+
+    @staticmethod
+    def _generate_call_graph(trace_data, output_file=None):
+        """Generate a call graph from the trace data.
+
+        Args:
+            trace_data: The full trace data from API
+            output_file: Output file for the graph (without extension)
+        """
+        global graphviz
+
+        try:
+            import graphviz
+        except ImportError:
+            graphviz = None
+
+        if not graphviz:
+            print("graphviz Python module is not installed. Generating text-based call graph instead.")
+            TraceFetcher._generate_text_call_graph(trace_data)
+            return
+
+        def extract_spans(data, spans=None):
+            """Recursively extract spans from trace data."""
+            if spans is None:
+                spans = []
+
+            if isinstance(data, dict):
+                if "spanId" in data and "operationName" in data:
+                    spans.append(data)
+                for value in data.values():
+                    extract_spans(value, spans)
+            elif isinstance(data, list):
+                for item in data:
+                    extract_spans(item, spans)
+            return spans
+
+        # Extract all spans from the trace data
+        spans = extract_spans(trace_data)
+
+        # Check if Graphviz binary is available
+        try:
+            import graphviz.backend
+            has_dot = graphviz.backend.find_executable('dot') is not None
+        except:
+            has_dot = False
+
+        if not has_dot:
+            print("Graphviz 'dot' executable not found. Generating text-based call graph instead.")
+            TraceFetcher._generate_text_call_graph(trace_data)
+            return
+
+        # Create a directed graph
+        dot = graphviz.Digraph(comment='Trace Call Graph')
+        dot.attr(rankdir='TB', size='12,16')
+        dot.attr('node', shape='box', fontsize='10', margin='0.1')
+
+        # Add nodes and edges
+        for span in spans:
+            span_id = span.get("spanId", "unknown")
+            operation_name = span.get("operationName", "unknown")
+            service_name = span.get("serviceName", "unknown")
+            duration = span.get("duration", 0)
+
+            # Format node label
+            label = "{}\\n({})\\n{}us".format(operation_name, service_name, duration)
+            dot.node(span_id, label)
+
+        # Add edges based on parent-child relationships
+        for span in spans:
+            span_id = span.get("spanId", "unknown")
+            parent_id = span.get("parentId")
+
+            if parent_id and parent_id != span_id:
+                dot.edge(parent_id, span_id)
+
+        # Save the graph
+        if output_file:
+            # Extract the directory and base name
+            directory = os.path.dirname(output_file)
+            basename = os.path.basename(output_file)
+            # Render the graph (this creates both .dot and .png files)
+            dot.render(filename=output_file, format='png', cleanup=True)
+            print("Call graph saved to {}.png".format(output_file))
+        else:
+            print(dot.source)  # Print DOT source
+
+        return dot
 
     def fetch_sql_detail(self, rid: str) -> dict:
         """Fetch SQL detail by RID from getDetailParamsByRid.jsonp API.
@@ -458,7 +742,14 @@ class TraceFetcher:
 
 # ========== DEFAULT PARAMETERS ==========
 # You can modify these values to set default parameters
-DEFAULT_ENDPOINT = "https://trace.souche-inc.com"
+
+# Environment endpoints
+ENV_ENDPOINTS = {
+    "pro": "https://trace.souche-inc.com",
+    "env": "https://test-trace.dasouche-inc.net"
+}
+DEFAULT_ENV = "pro"  # Default environment: pro or env
+
 DEFAULT_TRACE_ID = "1774764304798_AKFw"
 DEFAULT_DATE = "2026-03-29"
 
@@ -481,8 +772,10 @@ DEFAULT_EXTRACT_SQL = True
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch trace logs from Souche trace system")
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
-                        help="Souche trace API endpoint")
+    parser.add_argument("--env", default=DEFAULT_ENV, choices=["pro", "env"],
+                        help="Environment: pro (production) or env (test)")
+    parser.add_argument("--endpoint",
+                        help="Souche trace API endpoint (overrides --env)")
     parser.add_argument("--trace-id", default=DEFAULT_TRACE_ID,
                         help="Trace ID to fetch")
     parser.add_argument("--date", default=DEFAULT_DATE,
@@ -500,12 +793,20 @@ def main():
                         help="Extract and save SQL data to a separate file")
     parser.add_argument("--no-extract-sql", dest="extract_sql", action="store_false",
                         help="Disable SQL extraction")
+    parser.add_argument("--generate-call-graph", action="store_true",
+                        help="Generate a call graph from the trace data")
 
     args = parser.parse_args()
 
+    # Determine endpoint based on environment
+    if args.endpoint:
+        endpoint = args.endpoint
+    else:
+        endpoint = ENV_ENDPOINTS.get(args.env, ENV_ENDPOINTS["pro"])
+
     # Initialize the TraceFetcher class
     fetcher = TraceFetcher(
-        endpoint=args.endpoint,
+        endpoint=endpoint,
         cookies=args.cookies,
         verify_ssl=not args.insecure
     )
@@ -526,8 +827,21 @@ def main():
 
         result = fetcher.fetch_trace(args.trace_id, args.date)
 
-        # Generate dynamic filename for sql_details only
+        # Generate dynamic filename for full trace data
         current_time = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        # Generate call graph if requested
+        if args.generate_call_graph:
+            graph_filename = os.path.join(args.output_dir, f"trace_{args.trace_id}_{current_time}_call_graph")
+            print(f"Generating call graph...")
+            TraceFetcher._generate_call_graph(result, graph_filename)
+
+        # Write full trace data to file if not extracting SQL
+        if not args.extract_sql:
+            full_trace_file = os.path.join(args.output_dir, f"trace_{args.trace_id}_{current_time}_full.json")
+            with open(full_trace_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"Full trace data written to {full_trace_file}")
 
         # Extract SQL data
         if args.extract_sql:

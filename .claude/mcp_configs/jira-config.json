@@ -1,0 +1,28 @@
+{
+  "mcp_servers": [
+    {
+      "id": "jira-server",
+      "name": "Jira Server Integration",
+      "description": "MCP server for Jira integration",
+      "endpoint": "https://jira.souche-inc.com/",
+      "type": "jira",
+      "authentication": {
+        "type": "basic",
+        "credentials": {
+          "username": "${JIRA_USERNAME}",
+          "password": "${JIRA_PASSWORD}"
+        }
+      },
+      "capabilities": [
+        "issues:read",
+        "issues:write",
+        "projects:read",
+        "users:read"
+      ],
+      "config": {
+        "api_version": "2",
+        "timeout": 30000
+      }
+    }
+  ]
+}

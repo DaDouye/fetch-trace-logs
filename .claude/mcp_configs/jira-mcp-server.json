@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "servers": [
+    {
+      "id": "jira-souche",
+      "name": "SouChe Jira Server",
+      "description": "Jira Server instance for SouChe company",
+      "protocol": "http",
+      "host": "localhost",
+      "port": 8080,
+      "path": "/jira",
+      "environment": {
+        "JIRA_URL": "https://jira.souche-inc.com/",
+        "AUTH_TYPE": "basic"
+      },
+      "resources": [
+        {
+          "path": "/issues",
+          "methods": ["GET", "POST", "PUT", "DELETE"],
+          "description": "Access Jira issues"
+        },
+        {
+          "path": "/projects",
+          "methods": ["GET"],
+          "description": "Access Jira projects"
+        },
+        {
+          "path": "/users",
+          "methods": ["GET"],
+          "description": "Access Jira users"
+        }
+      ]
+    }
+  ]
+}
