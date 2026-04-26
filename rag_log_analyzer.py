@@ -152,15 +152,13 @@ class GitLogRAG:
         """构建问答系统"""
         self.logger.info("Building QA system...")
 
-        # 创建LLM实例（这里使用HuggingFace Hub模型，可以根据需要更改）
-        # 注意：您可能需要设置HUGGINGFACEHUB_API_TOKEN环境变量
-        from langchain_community.llms import HuggingFaceEndpoint
+        # 使用本地模型进行推理，避免网络问题
+        from langchain_huggingface import HuggingFacePipeline
 
-        llm = HuggingFaceEndpoint(
-            repo_id=llm_model,
-            temperature=0.1,
-            max_length=512,
-            huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN", "")
+        llm = HuggingFacePipeline.from_model_id(
+            model_id=llm_model,
+            task="text2text-generation",
+            pipeline_kwargs={"temperature": 0.1, "max_new_tokens": 512}
         )
 
         # 创建提示模板，专门用于代码和日志分析

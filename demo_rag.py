@@ -113,6 +113,8 @@ def demo_custom_analysis():
         repo_path = input("请输入您的 Git 仓库路径: ").strip()
 
         if not os.path.exists(repo_path):
+
+
             print(f"错误: 仓库路径 {repo_path} 不存在")
             return
 
