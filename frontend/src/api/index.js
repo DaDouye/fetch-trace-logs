@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const http = axios.create({
   baseURL: '/api',
-  timeout: 30000,
+  timeout: 300000,  // 5分钟
   headers: {
     'Content-Type': 'application/json'
   }
@@ -14,4 +14,8 @@ export function fetchRepos() {
 
 export function analyzeApi(params) {
   return http.post('/analyze', params)
+}
+
+export function analyzeJira(params) {
+  return http.post('/analyze-jira', params)
 }

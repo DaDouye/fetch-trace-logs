@@ -1,10 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { fetchRepos, analyzeApi } from '../api'
+import { fetchRepos, analyzeApi, analyzeJira } from '../api'
 
 export const useAnalyzerStore = defineStore('analyzer', () => {
   const repos = ref([])
   const result = ref(null)
+  const jiraResult = ref(null)
   const loading = ref(false)
   const error = ref(null)
 
@@ -32,5 +33,20 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
     }
   }
 
-  return { repos, result, loading, error, loadRepos, analyze }
+  async function analyzeJiraIssue(params) {
+    loading.value = true
+    error.value = null
+    jiraResult.value = null
+
+    try {
+      const res = await analyzeJira(params)
+      jiraResult.value = res.data
+    } catch (e) {
+      error.value = e.response?.data?.detail || e.message || 'JIRA 分析失败'
+    } finally {
+      loading.value = false
+    }
+  }
+
+  return { repos, result, jiraResult, loading, error, loadRepos, analyze, analyzeJiraIssue }
 })

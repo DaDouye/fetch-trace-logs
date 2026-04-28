@@ -509,15 +509,14 @@ class JavaCallChainAnalyzer:
         return '\n'.join(lines)
 
     def _serialize_call_chain(self, node: CallChainNode) -> List[Dict]:
-        """序列化调用链为 JSON 友好格式"""
-        result = [{
+        """序列化调用链为 JSON 友好格式（保留树结构）"""
+        result = {
             'layer': node.layer, 'class_name': node.class_name, 'method_name': node.method_name,
             'file_path': node.file_path, 'line_number': node.line_number, 'sql': node.sql,
-            'annotation': node.annotation, 'is_entry': node.is_entry
-        }]
-        for child in node.children:
-            result.extend(self._serialize_call_chain(child))
-        return result
+            'annotation': node.annotation, 'is_entry': node.is_entry,
+            'children': [self._serialize_call_chain(child) for child in node.children]
+        }
+        return [result]
 
 
 def main():

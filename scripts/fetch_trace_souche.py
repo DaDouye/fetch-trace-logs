@@ -44,7 +44,7 @@ class TraceFetcher:
         """Fetch trace tree from Souche trace system.
 
         Args:
-            trace_id: The trace ID to fetch
+            trace_id: The trace ID to fetch (can be multiple separated by semicolons)
             date: Date in YYYY-MM-DD format
 
         Returns:
@@ -52,7 +52,7 @@ class TraceFetcher:
         """
         begin_date = f"{date} 00:00:00.000"
         end_date = f"{date} 23:59:59.999"
-        url = f"{self.endpoint}/logtrace/show/logTreeByTraceid.json?traceid={trace_id}&beginDate={quote(begin_date)}&endDate={quote(end_date)}&regType=0"
+        url = f"{self.endpoint}/logtrace/show/logTreeByTraceid.json?traceid={quote(trace_id)}&beginDate={quote(begin_date)}&endDate={quote(end_date)}&regType=0"
         return self._make_request(url)
 
     def fetch_host(self) -> dict:
@@ -95,19 +95,28 @@ class TraceFetcher:
         try:
             if self.verify_ssl:
                 with urllib.request.urlopen(req) as response:
-                    return json.loads(response.read().decode('utf-8'))
+                    content = response.read().decode('utf-8')
             else:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 with urllib.request.urlopen(req, context=ctx) as response:
-                    return json.loads(response.read().decode('utf-8'))
+                    content = response.read().decode('utf-8')
+
+            if not content or content.strip() == '':
+                print(f"Warning: Empty response from {url}", file=sys.stderr)
+                return None
+
+            return json.loads(content)
         except urllib.error.HTTPError as e:
             print(f"HTTP Error {e.code}: {e.reason}", file=sys.stderr)
-            sys.exit(1)
+            return None
         except urllib.error.URLError as e:
             print(f"URL Error: {e.reason}", file=sys.stderr)
-            sys.exit(1)
+            return None
+        except json.JSONDecodeError as e:
+            print(f"JSON Decode Error: {e}", file=sys.stderr)
+            return None
 
     @staticmethod
     def _extract_params_from_sql(actual_sql: str, sql_template: str) -> list:
@@ -202,6 +211,41 @@ class TraceFetcher:
                 sql_items.extend(TraceFetcher.extract_sql_data(item))
 
         return sql_items
+
+    @staticmethod
+    def extract_api_paths(data: dict or list) -> list:
+        """Recursively extract all API paths with type='http-server' from trace data.
+
+        Args:
+            data: The trace data (dict or list)
+
+        Returns:
+            A list of unique API paths
+        """
+        api_paths = set()
+
+        if isinstance(data, dict):
+            # Handle nested response structure - look inside 'data' field
+            if 'data' in data and isinstance(data['data'], (dict, list)):
+                api_paths.update(TraceFetcher.extract_api_paths(data['data']))
+
+            if data.get("type") == "http-server":
+                path = data.get("path", "")
+                if path:
+                    api_paths.add(path)
+            # Also check 'path' field directly (some APIs use this)
+            path = data.get("path", "")
+            if path and isinstance(path, str) and path.startswith('/'):
+                api_paths.add(path)
+
+            for key, value in data.items():
+                if key != 'data' and isinstance(value, (dict, list)):
+                    api_paths.update(TraceFetcher.extract_api_paths(value))
+        elif isinstance(data, list):
+            for item in data:
+                api_paths.update(TraceFetcher.extract_api_paths(item))
+
+        return list(api_paths)
 
     @staticmethod
     def format_complete_sql(detail: dict) -> Optional[str]:

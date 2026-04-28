@@ -21,7 +21,7 @@ if env_path.exists():
         # If python-dotenv is not installed, manually read the .config file
         import io
         with open(env_path, 'r') as f:
-            for line in f:
+          for line in f:
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)

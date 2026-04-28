@@ -9,6 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
 
 from api.analyze import JavaCallChainAnalyzer
 from config_manager import get_all_git_repos
@@ -38,6 +42,17 @@ class AnalyzeRequest(BaseModel):
     cookies: Optional[str] = None     # 可选，trace API 认证 cookies
 
 
+class AnalyzeJiraRequest(BaseModel):
+    """JIRA 问题分析请求模型"""
+    jira_url: str                    # JIRA URL (必填)
+    repo_key: Optional[str] = None   # 仓库键名 (可选)
+    api_paths: Optional[List[str]] = None  # API 路径列表 (可选)
+    trace_id: Optional[str] = None    # Trace ID (可选)
+    trace_date: Optional[str] = None  # Trace 日期 (可选)
+    cookies: Optional[str] = None     # Trace API 认证 cookies (可选)
+    use_ai: bool = False             # 是否使用 AI 增强 (可选)
+
+
 class RepoInfo(BaseModel):
     """仓库信息模型"""
     key: str
@@ -53,6 +68,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "analyze": "POST /api/analyze",
+            "analyze_jira": "POST /api/analyze-jira",
             "repos": "GET /api/repos"
         }
     }
@@ -100,6 +116,48 @@ async def analyze_api(req: AnalyzeRequest):
         raise HTTPException(status_code=404, detail=f"仓库不存在: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
+
+
+@app.post("/api/analyze-jira")
+async def analyze_jira(req: AnalyzeJiraRequest):
+    """
+    分析 JIRA 问题并提供问题原因分析
+
+    Request Body:
+    - jira_url: JIRA URL (必填)
+    - repo_key: (可选) 仓库键名
+    - api_path: (可选) API 路径
+    - trace_id: (可选) Trace ID
+    - trace_date: (可选) Trace 日期
+    - cookies: (可选) Trace API 认证 cookies
+    - use_ai: (可选) 是否使用 AI 增强
+    """
+    try:
+        from api.analyzer.jira_analyzer import JiraAnalyzer
+
+        # 如果提供了 api_paths 但没有 repo_key，返回错误
+        if req.api_paths and not req.repo_key:
+            raise HTTPException(
+                status_code=400,
+                detail="repo_key is required when api_paths is provided"
+            )
+
+        analyzer = JiraAnalyzer(repo_key=req.repo_key)
+        result = analyzer.analyze(
+            jira_url=req.jira_url,
+            api_paths=req.api_paths,
+            trace_id=req.trace_id,
+            trace_date=req.trace_date,
+            cookies=req.cookies,
+            use_ai=req.use_ai
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"仓库不存在: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"JIRA 分析失败: {str(e)}")
 
 
 @app.get("/api/health")
