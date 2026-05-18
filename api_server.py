@@ -36,7 +36,9 @@ app.add_middleware(
 class AnalyzeRequest(BaseModel):
     """分析请求模型"""
     api_path: str               # 如 "/v1/customerAction/saveOrUpdateCustomer"
-    repo_key: str               # 如 "super_mario" (从 config 获取仓库路径)
+    repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
+    repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
+    ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
     trace_id: Optional[str] = None   # 可选，用于获取运行时数据
     date: Optional[str] = None       # 可选，如 "2026-04-23"
     cookies: Optional[str] = None     # 可选，trace API 认证 cookies
@@ -45,12 +47,14 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeJiraRequest(BaseModel):
     """JIRA 问题分析请求模型"""
     jira_url: str                    # JIRA URL (必填)
-    repo_key: Optional[str] = None   # 仓库键名 (可选)
+    repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
+    repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
+    ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
     api_paths: Optional[List[str]] = None  # API 路径列表 (可选)
     trace_id: Optional[str] = None    # Trace ID (可选)
     trace_date: Optional[str] = None  # Trace 日期 (可选)
     cookies: Optional[str] = None     # Trace API 认证 cookies (可选)
-    use_ai: bool = False             # 是否使用 AI 增强 (可选)
+    use_ai: bool = True             # 是否使用 AI 增强 (可选)
 
 
 class RepoInfo(BaseModel):
@@ -96,13 +100,23 @@ async def analyze_api(req: AnalyzeRequest):
 
     Request Body:
     - api_path: API 路径
-    - repo_key: 仓库键名
+    - repo_key: 仓库键名 (可选，与 repo_url 二选一)
+    - repo_url: Git 仓库 URL (可选，直接指定远程仓库)
+    - ref: 分支/ commit (默认 main)
     - trace_id: (可选) Trace ID
     - date: (可选) 日期
     - cookies: (可选) Trace API 认证 cookies
     """
     try:
-        analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key)
+        if req.repo_url:
+            analyzer = JavaCallChainAnalyzer(repo_url=req.repo_url, ref=req.ref)
+        elif req.repo_key:
+            analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="repo_key or repo_url is required"
+            )
         result = analyzer.analyze(
             req.api_path,
             req.trace_id,
@@ -125,7 +139,9 @@ async def analyze_jira(req: AnalyzeJiraRequest):
 
     Request Body:
     - jira_url: JIRA URL (必填)
-    - repo_key: (可选) 仓库键名
+    - repo_key: (可选) 仓库键名，与 repo_url 二选一
+    - repo_url: Git 仓库 URL (可选，直接指定远程仓库)
+    - ref: 分支/ commit (默认 main)
     - api_path: (可选) API 路径
     - trace_id: (可选) Trace ID
     - trace_date: (可选) Trace 日期
@@ -135,14 +151,17 @@ async def analyze_jira(req: AnalyzeJiraRequest):
     try:
         from api.analyzer.jira_analyzer import JiraAnalyzer
 
-        # 如果提供了 api_paths 但没有 repo_key，返回错误
-        if req.api_paths and not req.repo_key:
+        # 如果提供了 api_paths 但没有 repo_key 和 repo_url，返回错误
+        if req.api_paths and not req.repo_key and not req.repo_url:
             raise HTTPException(
                 status_code=400,
-                detail="repo_key is required when api_paths is provided"
+                detail="repo_key or repo_url is required when api_paths is provided"
             )
 
-        analyzer = JiraAnalyzer(repo_key=req.repo_key)
+        if req.repo_url:
+            analyzer = JiraAnalyzer(repo_url=req.repo_url, ref=req.ref)
+        else:
+            analyzer = JiraAnalyzer(repo_key=req.repo_key)
         result = analyzer.analyze(
             jira_url=req.jira_url,
             api_paths=req.api_paths,

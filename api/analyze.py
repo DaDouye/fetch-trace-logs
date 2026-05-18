@@ -2,14 +2,17 @@
 """
 Java 代码调用链静态分析器
 用于分析 Spring Boot 项目中的接口调用链路
+支持本地仓库和远程 Git 两种模式
 """
 
 import os
 import re
 import json
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path
+
+from api.git_fetcher import get_git_fetcher, GitFetcher
 
 
 @dataclass
@@ -38,21 +41,45 @@ class JavaCallChainAnalyzer:
         'list', 'map', 'set', 'is', 'has', 'new', 'if', 'for', 'while'
     }
 
-    def __init__(self, repo_path: str = None, repo_key: str = None):
-        if repo_key:
-            from config_manager import get_git_repo_url
-            repo_url = get_git_repo_url(repo_key)
-            if not repo_url:
-                raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
-            repo_name = repo_url.split('/')[-1].replace('.git', '')
-            self.repo_path = os.path.join('./repos', repo_name)
-        elif repo_path:
-            self.repo_path = repo_path
-        else:
-            raise ValueError("必须提供 repo_path 或 repo_key 参数")
+    def __init__(
+        self,
+        repo_path: str = None,
+        repo_key: str = None,
+        repo_url: str = None,
+        ref: str = "master"
+    ):
+        """
+        初始化分析器
 
-        self.web_src_path = os.path.join(self.repo_path, 'web/src/main/java')
-        self.config_path = os.path.join(self.repo_path, 'web/config')
+        :param repo_path: 本地仓库路径（优先使用）
+        :param repo_key: 仓库键名（从 config 获取 URL）
+        :param repo_url: 远程仓库 URL（直接指定，使用 GitFetcher）
+        :param ref: Git 分支/ commit（配合 repo_url 使用）
+        """
+        self._git_fetcher: Optional[GitFetcher] = None
+        self._use_remote = False
+
+        if repo_path:
+            self.repo_path = repo_path
+            self._use_remote = False
+        elif repo_key:
+            from config_manager import get_git_repo_url
+            url = get_git_repo_url(repo_key)
+            if not url:
+                raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
+            self.repo_path = None
+            self._git_fetcher = get_git_fetcher(url, ref)
+            self._use_remote = True
+        elif repo_url:
+            self.repo_path = None
+            self._git_fetcher = get_git_fetcher(repo_url, ref)
+            self._use_remote = True
+        else:
+            raise ValueError("必须提供 repo_path、repo_key 或 repo_url 参数")
+
+        if not self._use_remote:
+            self.web_src_path = os.path.join(self.repo_path, 'web/src/main/java')
+            self.config_path = os.path.join(self.repo_path, 'web/config')
 
         self._controller_cache: Dict[str, Tuple[str, str, int]] = {}
         self._service_impl_cache: Dict[str, str] = {}
@@ -92,6 +119,26 @@ class JavaCallChainAnalyzer:
 
         return result
 
+    def _read_file(self, file_path: str) -> Optional[str]:
+        """读取文件内容，兼容本地和远程模式"""
+        if self._use_remote:
+            # 远程模式：使用 GitFetcher
+            return self._git_fetcher.get_file(file_path)
+        else:
+            # 本地模式：直接读取
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+            except Exception:
+                return None
+
+    def _file_exists(self, file_path: str) -> bool:
+        """检查文件是否存在"""
+        if self._use_remote:
+            return self._git_fetcher.file_exists(file_path)
+        else:
+            return os.path.exists(file_path)
+
     def _find_controller_method(self, api_path: str) -> Optional[Tuple[str, str, str, int]]:
         search_path = api_path.strip('/')
         if search_path.endswith('.json'):
@@ -100,6 +147,13 @@ class JavaCallChainAnalyzer:
         if api_path in self._controller_cache:
             return self._controller_cache[api_path]
 
+        if self._use_remote:
+            return self._find_controller_method_remote(api_path)
+        else:
+            return self._find_controller_method_local(api_path)
+
+    def _find_controller_method_local(self, api_path: str) -> Optional[Tuple[str, str, str, int]]:
+        """本地模式：查找 Controller 方法"""
         json_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/json')
         if not os.path.exists(json_dir):
             return None
@@ -115,39 +169,77 @@ class JavaCallChainAnalyzer:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
 
-                class_match = re.search(r'public\s+class\s+(\w+)', content)
-                if not class_match:
-                    continue
-                class_name = class_match.group(1)
+                result = self._extract_controller_from_content(content, file_path, api_path)
+                if result:
+                    self._controller_cache[api_path] = result
+                    return result
 
-                pkg_match = re.search(r'package\s+([\w\.]+)\s*;', content)
-                package_prefix = ''
-                if pkg_match:
-                    pkg = pkg_match.group(1)
-                    for part in pkg.split('.'):
-                        if part in ['v1', 'v2', 'v3', 'crm', 'ai', 'admin']:
-                            package_prefix = part
-                            break
+        return None
 
-                api_match = re.search(r'@Api\s*\(\s*value\s*=\s*["\']([^"\']+)["\']', content)
-                api_value = api_match.group(1) if api_match else class_name
+    def _find_controller_method_remote(self, api_path: str) -> Optional[Tuple[str, str, str, int]]:
+        """远程模式：查找 Controller 方法"""
+        json_dir = 'web/src/main/java/com/jiaxuan/supermario/json'
+        files = self._git_fetcher.list_files(json_dir)
+        if not files:
+            return None
 
-                for match in REST_ANNOTATION_PATTERN.finditer(content):
-                    rest_path = match.group(1).strip('/')
+        REST_ANNOTATION_PATTERN = re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL)
 
-                    possible_paths = [
-                        f"/{package_prefix}/{api_value}/{rest_path}" if package_prefix else f"/{api_value}/{rest_path}",
-                        f"/{rest_path}",
-                    ]
+        for file_rel_path in files:
+            if not file_rel_path.endswith('.java'):
+                continue
 
-                    for full_path in possible_paths:
-                        if self._match_api_path(full_path, api_path):
-                            method_name = self._find_method_for_annotation(content, match.start())
-                            line_number = content[:match.start()].count('\n') + 1
+            content = self._read_file(file_rel_path)
+            if not content:
+                continue
 
-                            result = (class_name, method_name, file_path, line_number)
-                            self._controller_cache[api_path] = result
-                            return result
+            result = self._extract_controller_from_content(content, file_rel_path, api_path)
+            if result:
+                self._controller_cache[api_path] = result
+                return result
+
+        return None
+
+    def _extract_controller_from_content(
+        self,
+        content: str,
+        file_path: str,
+        api_path: str
+    ) -> Optional[Tuple[str, str, str, int]]:
+        """从文件内容中提取 Controller 信息"""
+        class_match = re.search(r'public\s+class\s+(\w+)', content)
+        if not class_match:
+            return None
+        class_name = class_match.group(1)
+
+        pkg_match = re.search(r'package\s+([\w\.]+)\s*;', content)
+        package_prefix = ''
+        if pkg_match:
+            pkg = pkg_match.group(1)
+            for part in pkg.split('.'):
+                if part in ['v1', 'v2', 'v3', 'crm', 'ai', 'admin']:
+                    package_prefix = part
+                    break
+
+        api_match = re.search(r'@Api\s*\(\s*value\s*=\s*["\']([^"\']+)["\']', content)
+        api_value = api_match.group(1) if api_match else class_name
+
+        REST_ANNOTATION_PATTERN = re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL)
+
+        for match in REST_ANNOTATION_PATTERN.finditer(content):
+            rest_path = match.group(1).strip('/')
+
+            possible_paths = [
+                f"/{package_prefix}/{api_value}/{rest_path}" if package_prefix else f"/{api_value}/{rest_path}",
+                f"/{rest_path}",
+            ]
+
+            for full_path in possible_paths:
+                if self._match_api_path(full_path, api_path):
+                    method_name = self._find_method_for_annotation(content, match.start())
+                    line_number = content[:match.start()].count('\n') + 1
+
+                    return (class_name, method_name, file_path, line_number)
 
         return None
 
@@ -174,8 +266,18 @@ class JavaCallChainAnalyzer:
         return method_match.group(1) if method_match else "unknown"
 
     def _build_call_chain(self, class_name: str, method_name: str, file_path: str, line_number: int) -> CallChainNode:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        content = self._read_file(file_path)
+        if not content:
+            # 创建空节点
+            return CallChainNode(
+                layer='Controller',
+                class_name=class_name,
+                method_name=method_name,
+                file_path=file_path,
+                line_number=line_number,
+                annotation=f'@Rest("{method_name}")',
+                is_entry=True
+            )
 
         root = CallChainNode(
             layer='Controller',
@@ -270,8 +372,10 @@ class JavaCallChainAnalyzer:
             return CallChainNode(layer='Service', class_name=service_field, method_name=method_name,
                                file_path='Not found', line_number=line_number)
 
-        with open(impl_path, 'r', encoding='utf-8', errors='ignore') as f:
-            impl_content = f.read()
+        impl_content = self._read_file(impl_path)
+        if not impl_content:
+            return CallChainNode(layer='Service', class_name=service_field, method_name=method_name,
+                               file_path=impl_path, line_number=line_number)
 
         impl_method = self._find_implementation_method(impl_content, method_name)
         if not impl_method:
@@ -300,8 +404,10 @@ class JavaCallChainAnalyzer:
 
     def _trace_this_call(self, class_path: str, method_name: str, line_number: int) -> Optional[CallChainNode]:
         """追踪 this.method() 调用"""
-        with open(class_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        content = self._read_file(class_path)
+        if not content:
+            return CallChainNode(layer='Internal', class_name=os.path.basename(class_path).replace('.java', ''),
+                               method_name=method_name, file_path=class_path, line_number=line_number)
 
         method_info = self._find_method_in_content(content, method_name)
         if not method_info:
@@ -319,7 +425,6 @@ class JavaCallChainAnalyzer:
                 if dao_node:
                     internal_node.children.append(dao_node)
             elif 'Service' in call['class']:
-                # 追踪到其他 Service
                 service_node = self._trace_call(call['class'], call['method'], call['line'])
                 if service_node:
                     internal_node.children.append(service_node)
@@ -366,15 +471,34 @@ class JavaCallChainAnalyzer:
             base_name = base_name[1:]
         impl_name = base_name + 'ServiceImpl.java'
 
-        impl_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/service/impl')
-        if os.path.exists(impl_dir):
-            for root, dirs, files in os.walk(impl_dir):
-                for file in files:
-                    if file.lower() == impl_name.lower():
-                        impl_path = os.path.join(root, file)
-                        self._service_impl_cache[service_interface] = impl_path
-                        return impl_path
+        if self._use_remote:
+            # 远程模式：搜索文件
+            impl_path = self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/service/impl', impl_name)
+            if impl_path:
+                self._service_impl_cache[service_interface] = impl_path
+                return impl_path
+        else:
+            # 本地模式
+            impl_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/service/impl')
+            if os.path.exists(impl_dir):
+                for root, dirs, files in os.walk(impl_dir):
+                    for file in files:
+                        if file.lower() == impl_name.lower():
+                            impl_path = os.path.join(root, file)
+                            self._service_impl_cache[service_interface] = impl_path
+                            return impl_path
 
+        return None
+
+    def _search_remote_file(self, directory: str, filename: str) -> Optional[str]:
+        """在远程仓库目录中搜索文件"""
+        files = self._git_fetcher.list_files(directory)
+        for file_path in files:
+            if file_path.endswith(filename):
+                return file_path
+            # 也检查带路径的
+            if filename in file_path:
+                return file_path
         return None
 
     def _trace_dao_call(self, dao_class: str, method_name: str, line_number: int) -> Optional[CallChainNode]:
@@ -406,12 +530,15 @@ class JavaCallChainAnalyzer:
     def _find_mapper_file(self, mapper_name: str) -> Optional[str]:
         """查找 Mapper 接口文件"""
         mapper_file = mapper_name + '.java'
-        mapper_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/dao/mapper')
 
-        if os.path.exists(mapper_dir):
-            for root, dirs, files in os.walk(mapper_dir):
-                if mapper_file in files:
-                    return os.path.join(root, mapper_file)
+        if self._use_remote:
+            return self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/dao/mapper', mapper_file)
+        else:
+            mapper_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/dao/mapper')
+            if os.path.exists(mapper_dir):
+                for root, dirs, files in os.walk(mapper_dir):
+                    if mapper_file in files:
+                        return os.path.join(root, mapper_file)
         return None
 
     def _get_sql_from_mapper(self, mapper_name: str, method_name: str) -> Optional[str]:
@@ -420,47 +547,93 @@ class JavaCallChainAnalyzer:
         if cache_key in self._mapper_sql_cache:
             return self._mapper_sql_cache[cache_key].get(method_name)
 
-        sqlmap_dir = self.config_path
-        if not os.path.exists(sqlmap_dir):
-            return None
+        if self._use_remote:
+            # 远程模式：需要从 config 目录获取 XML
+            sqlmap_dir = 'web/config'
+            xml_files = self._git_fetcher.list_files(sqlmap_dir)
+            class_name = mapper_name
+            for suffix in ['Mapper', 'DAO', 'Manager']:
+                if class_name.endswith(suffix):
+                    class_name = class_name[:-len(suffix)]
+                    break
+            class_name = class_name + 'Mapper'
 
-        class_name = mapper_name
-        for suffix in ['Mapper', 'DAO', 'Manager']:
-            if class_name.endswith(suffix):
-                class_name = class_name[:-len(suffix)]
-                break
-        class_name = class_name + 'Mapper'
+            for xml_path in xml_files:
+                if not xml_path.endswith('.xml'):
+                    continue
 
-        xml_files = list(Path(sqlmap_dir).glob('**/*Mapper.xml'))
+                xml_content = self._read_file(xml_path)
+                if not xml_content:
+                    continue
 
-        for xml_file in xml_files:
-            with open(xml_file, 'r', encoding='utf-8', errors='ignore') as f:
-                xml_content = f.read()
+                ns_match = re.search(r'namespace\s*=\s*["\']([^"\']+)["\']', xml_content)
+                if not ns_match:
+                    continue
 
-            ns_match = re.search(r'namespace\s*=\s*["\']([^"\']+)["\']', xml_content)
-            if not ns_match:
-                continue
+                full_mapper_name = ns_match.group(1)
+                mn_lower = mapper_name.lower()
+                cn_lower = class_name.lower()
+                fn_lower = full_mapper_name.lower()
 
-            full_mapper_name = ns_match.group(1)
-            mn_lower = mapper_name.lower()
-            cn_lower = class_name.lower()
-            fn_lower = full_mapper_name.lower()
-            if not (fn_lower.endswith('.' + mn_lower) or fn_lower.endswith('/' + mn_lower) or
-                    fn_lower.endswith('.' + cn_lower) or fn_lower.endswith('/' + cn_lower)):
-                continue
+                if not (fn_lower.endswith('.' + mn_lower) or fn_lower.endswith('/' + mn_lower) or
+                        fn_lower.endswith('.' + cn_lower) or fn_lower.endswith('/' + cn_lower)):
+                    continue
 
-            sql_cache = self._mapper_sql_cache.setdefault(cache_key, {})
+                sql_cache = self._mapper_sql_cache.setdefault(cache_key, {})
 
-            for sql_match in re.finditer(
-                r'<(?P<type>select|insert|update|delete)\s+id\s*=\s*["\'](\w+)["\'][^>]*>(?P<sql>.*?)</(?P=type)>',
-                xml_content, re.DOTALL | re.IGNORECASE
-            ):
-                sql_id = sql_match.group(2)
-                sql_text = sql_match.group('sql').strip()
-                sql_text = re.sub(r'\s+', ' ', sql_text)
-                sql_cache[sql_id] = sql_text
+                for sql_match in re.finditer(
+                    r'<(?P<type>select|insert|update|delete)\s+id\s*=\s*["\'](\w+)["\'][^>]*>(?P<sql>.*?)</(?P=type)>',
+                    xml_content, re.DOTALL | re.IGNORECASE
+                ):
+                    sql_id = sql_match.group(2)
+                    sql_text = sql_match.group('sql').strip()
+                    sql_text = re.sub(r'\s+', ' ', sql_text)
+                    sql_cache[sql_id] = sql_text
 
-            return sql_cache.get(method_name)
+                return sql_cache.get(method_name)
+        else:
+            # 本地模式
+            sqlmap_dir = self.config_path
+            if not os.path.exists(sqlmap_dir):
+                return None
+
+            class_name = mapper_name
+            for suffix in ['Mapper', 'DAO', 'Manager']:
+                if class_name.endswith(suffix):
+                    class_name = class_name[:-len(suffix)]
+                    break
+            class_name = class_name + 'Mapper'
+
+            xml_files = list(Path(sqlmap_dir).glob('**/*Mapper.xml'))
+
+            for xml_file in xml_files:
+                with open(xml_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    xml_content = f.read()
+
+                ns_match = re.search(r'namespace\s*=\s*["\']([^"\']+)["\']', xml_content)
+                if not ns_match:
+                    continue
+
+                full_mapper_name = ns_match.group(1)
+                mn_lower = mapper_name.lower()
+                cn_lower = class_name.lower()
+                fn_lower = full_mapper_name.lower()
+                if not (fn_lower.endswith('.' + mn_lower) or fn_lower.endswith('/' + mn_lower) or
+                        fn_lower.endswith('.' + cn_lower) or fn_lower.endswith('/' + cn_lower)):
+                    continue
+
+                sql_cache = self._mapper_sql_cache.setdefault(cache_key, {})
+
+                for sql_match in re.finditer(
+                    r'<(?P<type>select|insert|update|delete)\s+id\s*=\s*["\'](\w+)["\'][^>]*>(?P<sql>.*?)</(?P=type)>',
+                    xml_content, re.DOTALL | re.IGNORECASE
+                ):
+                    sql_id = sql_match.group(2)
+                    sql_text = sql_match.group('sql').strip()
+                    sql_text = re.sub(r'\s+', ' ', sql_text)
+                    sql_cache[sql_id] = sql_text
+
+                return sql_cache.get(method_name)
 
         return None
 
@@ -522,18 +695,25 @@ class JavaCallChainAnalyzer:
 def main():
     import sys
     if len(sys.argv) < 3:
-        print("Usage: python analyze.py <api_path> <repo_key>")
+        print("Usage: python analyze.py <api_path> <repo_key> [repo_url]")
+        print("  repo_url is optional, will use repo_key or local repo instead")
         sys.exit(1)
 
     api_path = sys.argv[1]
-    repo_key = sys.argv[2]
+    repo_key = sys.argv[2] if len(sys.argv) > 2 else None
+    repo_url = sys.argv[3] if len(sys.argv) > 3 else None
 
-    analyzer = JavaCallChainAnalyzer(repo_key=repo_key)
+    if repo_url:
+        analyzer = JavaCallChainAnalyzer(repo_url=repo_url)
+    elif repo_key:
+        analyzer = JavaCallChainAnalyzer(repo_key=repo_key)
+    else:
+        print("Error: must provide repo_key or repo_url")
+        sys.exit(1)
+
     result = analyzer.analyze(api_path)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
     main()
-
-

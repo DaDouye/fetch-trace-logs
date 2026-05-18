@@ -120,7 +120,7 @@ class JiraClient:
         Extract keywords from JIRA issue for code search
 
         :param issue_data: Issue data from get_issue()
-        :return: Dict with keys 'api_paths', 'class_names', 'error_patterns'
+        :return: Dict with keys 'api_paths', 'class_names', 'error_patterns', 'business_terms'
         """
         keywords = {
             'api_paths': [],

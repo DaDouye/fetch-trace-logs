@@ -13,32 +13,28 @@
         </n-gi>
       </n-grid>
 
-      <n-grid :cols="3" :x-gap="16" responsive="screen" item-responsive>
+      <n-grid :cols="2" :x-gap="16" responsive="screen" item-responsive>
         <n-gi span="1">
-          <n-form-item label="仓库 (可选)" path="repoKey">
-            <n-select
-              v-model:value="formValue.repoKey"
-              :options="repoOptions"
-              placeholder="请选择仓库"
-              filterable
+          <n-form-item label="Git 地址" path="repoUrl">
+            <n-input
+              v-model:value="formValue.repoUrl"
+              placeholder="如: https://github.com/user/repo.git"
               clearable
             />
           </n-form-item>
         </n-gi>
-        <n-gi span="2">
-          <n-form-item label="API 路径 (可选，多个用换行分隔)" path="apiPath">
+        <n-gi span="1">
+          <n-form-item label="分支 (可选，默认 main)" path="ref">
             <n-input
-              v-model:value="formValue.apiPath"
-              type="textarea"
-              placeholder="如: /v1/customer/saveOrUpdate"
-              :autosize="{ minRows: 2, maxRows: 5 }"
-              @keydown.enter="handleAnalyze"
+              v-model:value="formValue.ref"
+              placeholder="main"
+              clearable
             />
           </n-form-item>
         </n-gi>
       </n-grid>
 
-      <n-grid :cols="4" :x-gap="16" responsive="screen" item-responsive>
+      <n-grid :cols="3" :x-gap="16" responsive="screen" item-responsive>
         <n-gi span="1">
           <n-form-item label="Trace ID (可选)" path="traceId">
             <n-space align="end">
@@ -76,11 +72,6 @@
             />
           </n-form-item>
         </n-gi>
-        <n-gi span="1">
-          <n-form-item label="AI 增强 (可选)" path="useAi">
-            <n-switch v-model:value="formValue.useAi" />
-          </n-form-item>
-        </n-gi>
       </n-grid>
 
       <n-space justify="end">
@@ -97,7 +88,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed } from 'vue'
 import { useAnalyzerStore } from '../stores/analyzer'
 
 const store = useAnalyzerStore()
@@ -105,28 +96,19 @@ const store = useAnalyzerStore()
 const formRef = ref(null)
 const formValue = ref({
   jiraUrl: '',
-  repoKey: null,
-  apiPath: '',
+  repoUrl: '',
+  ref: 'master',
   traceId: '',
   traceDate: null,
-  cookies: '',
-  useAi: false
+  cookies: ''
 })
 
 const rules = {
   jiraUrl: { required: true, message: '请输入 JIRA 地址', trigger: 'input' }
 }
 
-const repoOptions = computed(() =>
-  store.repos.map(r => ({ label: r.name, value: r.key }))
-)
-
 const loading = computed(() => store.loading)
 const error = computed(() => store.error)
-
-onMounted(() => {
-  store.loadRepos()
-})
 
 function handleAnalyze() {
   formRef.value?.validate((errors) => {
@@ -136,18 +118,14 @@ function handleAnalyze() {
       jira_url: formValue.value.jiraUrl.trim()
     }
 
-    if (formValue.value.repoKey) params.repo_key = formValue.value.repoKey
-    if (formValue.value.apiPath) {
-      const paths = formValue.value.apiPath.split('\n').map(p => p.trim()).filter(p => p)
-      if (paths.length > 0) params.api_paths = paths
-    }
+    if (formValue.value.repoUrl) params.repo_url = formValue.value.repoUrl.trim()
+    if (formValue.value.ref) params.ref = formValue.value.ref
     if (formValue.value.traceId) params.trace_id = formValue.value.traceId
     if (formValue.value.traceDate) {
       const d = new Date(formValue.value.traceDate)
       params.trace_date = d.toISOString().split('T')[0]
     }
     if (formValue.value.cookies) params.cookies = formValue.value.cookies
-    if (formValue.value.useAi) params.use_ai = formValue.value.useAi
 
     store.analyzeJiraIssue(params)
   })

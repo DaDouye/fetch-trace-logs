@@ -23,7 +23,8 @@ class AIAnalyzer:
         self,
         jira_content: Dict[str, Any],
         code_context: Dict[str, Any],
-        trace_data: Optional[Dict[str, Any]] = None
+        trace_data: Optional[Dict[str, Any]] = None,
+        rag_context: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Analyze JIRA issue using AI and provide cause analysis
@@ -31,6 +32,7 @@ class AIAnalyzer:
         :param jira_content: JIRA issue content
         :param code_context: Code search results and call chains
         :param trace_data: Optional trace data
+        :param rag_context: Optional RAG context from LightRAG
         :return: Analysis result with possible causes
         """
         if not self.api_key:
@@ -39,8 +41,8 @@ class AIAnalyzer:
                 'possible_causes': []
             }
 
-        # Build prompt
-        prompt = self._build_prompt(jira_content, code_context, trace_data)
+        # Build prompt with optional RAG context
+        prompt = self._build_prompt(jira_content, code_context, trace_data, rag_context)
 
         try:
             response = self._call_claude(prompt)
@@ -55,7 +57,8 @@ class AIAnalyzer:
         self,
         jira_content: Dict[str, Any],
         code_context: Dict[str, Any],
-        trace_data: Optional[Dict[str, Any]]
+        trace_data: Optional[Dict[str, Any]],
+        rag_context: Optional[str] = None
     ) -> str:
         """Build analysis prompt for Claude"""
 
@@ -81,7 +84,13 @@ class AIAnalyzer:
 - 摘要: {summary}
 - 描述: {description or '无'}
 - 线上问题描述: {custom_field or '无'}
+"""
 
+        # Add RAG context if available
+        if rag_context:
+            prompt += f"\n## RAG检索到的相关上下文\n{rag_context}\n"
+
+        prompt += """
 ## 代码上下文
 ### 搜索到的相关代码文件:
 """

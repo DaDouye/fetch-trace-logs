@@ -15,6 +15,7 @@ from api.jira_client import JiraClient
 from api.analyzer.rule_engine import RuleEngine
 from api.analyzer.code_search import CodeSearch
 from api.analyzer.ai_analyzer import AIAnalyzer
+from api.analyzer.lightrag_indexer import LightRAGIndexer
 
 
 class JiraAnalyzer:
@@ -23,20 +24,31 @@ class JiraAnalyzer:
     Orchestrates JIRA fetching, code search, and cause analysis
     """
 
-    def __init__(self, repo_key: str = None, repo_path: str = None):
+    def __init__(
+        self,
+        repo_key: str = None,
+        repo_path: str = None,
+        repo_url: str = None,
+        ref: str = "master"
+    ):
         """
         Initialize analyzer
 
         :param repo_key: Repository key from config
         :param repo_path: Direct repository path (alternative to repo_key)
+        :param repo_url: Remote Git URL (alternative to repo_key)
+        :param ref: Git branch/commit (used with repo_url)
         """
         self.repo_key = repo_key
-        self.repo_path = repo_path or self._resolve_repo_path(repo_key)
+        self.repo_path = repo_path
+        self.repo_url = repo_url
+        self.ref = ref
 
         self.jira_client = JiraClient()
         self.rule_engine = RuleEngine()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
         self.ai_analyzer = AIAnalyzer()
+        self.rag_indexer = LightRAGIndexer()
 
     def _resolve_repo_path(self, repo_key: str = None) -> Optional[str]:
         """Resolve repository path from key or return None"""
@@ -159,8 +171,8 @@ class JiraAnalyzer:
         print(f"[CodeContext] repo_key: {self.repo_key}")
         print(f"[CodeContext] api_paths: {api_paths}")
 
-        if not self.repo_path:
-            print("[CodeContext] No repo_path, returning empty context")
+        if not self.repo_path and not self.repo_url:
+            print("[CodeContext] No repo_path or repo_url, returning empty context")
             return context
 
         # Get keywords from JIRA for search
@@ -169,8 +181,10 @@ class JiraAnalyzer:
         context['search_keywords'] = keywords
         print(f"[CodeContext] Keywords: {keywords}")
 
-        # Search codebase - use trace API paths if no api_paths provided
+        # 使用 JIRA 中的 api_paths 进行代码搜索
         search_api_paths = keywords.get('api_paths', [])
+        if not search_api_paths:
+            search_api_paths = []
 
         if self.code_search:
             search_results = self.code_search.search(
@@ -215,6 +229,7 @@ class JiraAnalyzer:
                     print(f"[CodeContext] Failed to extract API paths from trace: {e}")
 
         # Perform call chain analysis for each API path
+        # 优先使用用户提供的api_paths，其次是trace提取的
         call_chain_paths = api_paths if api_paths else trace_api_paths
         print(f"[CodeContext] Call chain paths: {call_chain_paths}")
         if call_chain_paths:
@@ -231,14 +246,17 @@ class JiraAnalyzer:
 
     def _analyze_call_chain(self, api_path: str) -> Optional[Dict[str, Any]]:
         """Perform call chain analysis using existing analyzer"""
-        if not self.repo_key:
-            print(f"[CallChain] No repo_key, skipping call chain analysis for {api_path}")
+        if not self.repo_key and not self.repo_url:
+            print(f"[CallChain] No repo_key or repo_url, skipping call chain analysis for {api_path}")
             return None
 
         try:
             from api.analyze import JavaCallChainAnalyzer
             print(f"[CallChain] Analyzing call chain for: {api_path}")
-            analyzer = JavaCallChainAnalyzer(repo_key=self.repo_key)
+            if self.repo_url:
+                analyzer = JavaCallChainAnalyzer(repo_url=self.repo_url, ref=self.ref)
+            else:
+                analyzer = JavaCallChainAnalyzer(repo_key=self.repo_key)
             result = analyzer.analyze(api_path)
             print(f"[CallChain] Result: {result.get('error', 'success')}")
             return result
@@ -286,9 +304,14 @@ class JiraAnalyzer:
 
         # AI-enhanced analysis
         ai_enhanced = False
+        rag_context = None
         if use_ai:
             try:
-                ai_result = self.ai_analyzer.analyze(jira, code_context, trace_data)
+                # Get RAG context for enhanced analysis
+                rag_context = self.rag_indexer.get_context_for_analysis(jira, code_context)
+                print(f"[_analyze_causes] RAG context retrieved: {len(rag_context) if rag_context else 0} chars")
+
+                ai_result = self.ai_analyzer.analyze(jira, code_context, trace_data, rag_context)
                 ai_causes = ai_result.get('possible_causes', [])
 
                 if ai_causes:
@@ -321,6 +344,23 @@ class JiraAnalyzer:
                     'suggestion': '1. 检查相关接口的日志\n2. 验证数据状态\n3. 确认业务流程是否正常',
                     'confidence': 0.5
                 })
+
+        # Index data for future RAG retrieval (after successful analysis)
+        try:
+            # Index JIRA issue
+            self.rag_indexer.index_jira_issue(jira.get('key', ''), jira)
+            # Index code files
+            if code_context.get('files'):
+                self.rag_indexer.index_code_files(code_context['files'])
+            # Index trace data
+            trace_data_for_index = code_context.get('trace_data')
+            if trace_data_for_index and not trace_data_for_index.get('error'):
+                self.rag_indexer.index_trace_data(
+                    trace_data_for_index.get('trace_id', ''),
+                    trace_data_for_index
+                )
+        except Exception as e:
+            print(f"[_analyze_causes] RAG indexing error: {e}")
 
         return {
             'possible_causes': causes,
