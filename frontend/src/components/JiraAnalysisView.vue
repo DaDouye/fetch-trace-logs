@@ -2,207 +2,350 @@
   <div class="jira-analysis-view">
     <n-spin :show="loading">
       <template v-if="jiraResult">
-        <!-- JIRA Issue Section -->
-        <n-card title="JIRA 问题" embedded class="section-card">
-          <n-descriptions label-placement="top" :column="2">
-            <n-descriptions-item label="问题编号">
-              <n-tag type="info">{{ jiraResult.jira?.key }}</n-tag>
-            </n-descriptions-item>
-            <n-descriptions-item label="状态">
-              <n-tag :type="getStatusType(jiraResult.jira?.status)">
-                {{ jiraResult.jira?.status }}
-              </n-tag>
-            </n-descriptions-item>
-            <n-descriptions-item label="问题类型">
-              {{ jiraResult.jira?.issue_type }}
-            </n-descriptions-item>
-            <n-descriptions-item label="优先级">
-              {{ jiraResult.jira?.priority }}
-            </n-descriptions-item>
-            <n-descriptions-item label="报告人">
-              {{ jiraResult.jira?.reporter }}
-            </n-descriptions-item>
-            <n-descriptions-item label="负责人">
-              {{ jiraResult.jira?.assignee || '未分配' }}
-            </n-descriptions-item>
-          </n-descriptions>
+        <n-card title="故障初筛卡片" embedded class="section-card">
+          <div class="card-header">
+            <div>
+              <n-tag type="info">{{ jiraResult.jira?.key || jiraResult.issue_key }}</n-tag>
+              <h2>{{ jiraResult.jira?.summary || '暂无摘要' }}</h2>
+            </div>
+            <n-space>
+              <n-tag>{{ requestContext.environment || '未填写环境' }}</n-tag>
+              <n-tag type="warning">{{ requestContext.problem_type || '未填写类型' }}</n-tag>
+            </n-space>
+          </div>
 
           <n-divider />
-          <h4>摘要</h4>
-          <p class="summary-text">{{ jiraResult.jira?.summary }}</p>
 
-          <template v-if="jiraResult.jira?.description">
-            <n-divider />
-            <h4>描述</h4>
-            <n-input
-              type="textarea"
-              :value="jiraResult.jira.description"
-              read-only
-              :autosize="{ minRows: 3, maxRows: 10 }"
-            />
-          </template>
+          <section class="card-section">
+            <h3>排查范围</h3>
+            <n-descriptions label-placement="top" :column="3">
+              <n-descriptions-item label="时间窗口">
+                {{ timeWindowText }}
+              </n-descriptions-item>
+              <n-descriptions-item label="服务范围">
+                <n-space v-if="requestContext.services?.length">
+                  <n-tag v-for="service in requestContext.services" :key="service" size="small">
+                    {{ service }}
+                  </n-tag>
+                </n-space>
+                <span v-else>未填写</span>
+              </n-descriptions-item>
+              <n-descriptions-item label="Trace">
+                {{ displayTraceId }}
+              </n-descriptions-item>
+            </n-descriptions>
+          </section>
 
-          <template v-if="jiraResult.jira?.customfield_19900">
-            <n-divider />
-            <h4>线上问题描述字段</h4>
-            <p class="summary-text">{{ jiraResult.jira.customfield_19900 }}</p>
-          </template>
+          <section class="card-section">
+            <h3>影响信号</h3>
+            <div class="signal-grid">
+              <div class="signal-item">
+                <span>相关线索</span>
+                <strong>{{ evidenceCount }} 条</strong>
+              </div>
+              <div class="signal-item">
+                <span>Trace SQL</span>
+                <strong>{{ hasSqlText }}</strong>
+              </div>
+              <div class="signal-item">
+                <span>可能原因</span>
+                <strong>{{ topCauses.length }} 个</strong>
+              </div>
+            </div>
+          </section>
 
-          <template v-if="jiraResult.jira?.attachment?.length">
-            <n-divider />
-            <h4>附件</h4>
-            <n-list hoverable>
-              <n-list-item v-for="(att, index) in jiraResult.jira.attachment" :key="index">
-                <n-a :href="att.content" target="_blank">{{ att.filename }}</n-a>
-              </n-list-item>
-            </n-list>
-          </template>
-        </n-card>
-
-        <!-- Possible Causes Section -->
-        <n-card title="可能的原因" embedded class="section-card">
-          <template v-if="jiraResult.analysis?.possible_causes?.length">
+          <section class="card-section">
+            <h3>关键时间线</h3>
             <n-list>
-              <n-list-item v-for="cause in jiraResult.analysis.possible_causes" :key="cause.id">
-                <n-tag type="warning" size="small">{{ cause.category }}</n-tag>
-                <p v-if="cause.analysis" class="cause-analysis">{{ cause.analysis }}</p>
-                <p v-if="cause.suggestion" class="cause-suggestion">{{ cause.suggestion }}</p>
-                <template v-if="cause.evidence_files?.length">
-                  <n-divider />
-                  <p class="evidence-label">相关代码文件:</p>
-                  <n-ul>
-                    <n-li v-for="file in cause.evidence_files" :key="file.file_path">
-                      <n-text depth="3">{{ file.file_path }}</n-text>
-                    </n-li>
-                  </n-ul>
-                </template>
+              <n-list-item v-for="item in timelineItems" :key="item.label">
+                <n-thing :title="item.label" :description="item.value" />
               </n-list-item>
             </n-list>
-          </template>
-          <n-empty v-else description="未发现明显问题原因" />
-        </n-card>
+          </section>
 
-        <!-- Code Search Results -->
-        <n-card
-          v-if="jiraResult.code_context?.files?.length"
-          title="相关代码文件"
-          embedded
-          class="section-card"
-        >
-          <n-list hoverable clickable>
-            <n-list-item v-for="file in jiraResult.code_context.files" :key="file.file_path">
-              <n-thing>
-                <template #header>
-                  {{ getFileName(file.file_path) }}
-                </template>
-                <template #description>
-                  <n-text depth="3">{{ file.file_path }}</n-text>
-                </template>
-                <n-ul v-if="file.matches?.length">
-                  <n-li v-for="(match, idx) in file.matches" :key="idx">
-                    <n-text code>Line {{ match.line_number }}</n-text>
-                    : {{ match.content.substring(0, 100) }}
-                  </n-li>
-                </n-ul>
-              </n-thing>
-            </n-list-item>
-          </n-list>
-        </n-card>
+          <section class="card-section">
+            <h3>链路日志分析</h3>
+            <template v-if="traceSummary">
+              <n-alert
+                :type="traceSummary.success ? 'success' : 'error'"
+                :title="traceSummary.success ? 'Trace 获取成功' : 'Trace 获取失败'"
+              >
+                {{ traceSummary.success ? traceSummary.evidence_summary : traceFailureReason }}
+              </n-alert>
 
-        <!-- Call Chain Section -->
-        <n-card
-          v-if="jiraResult.code_context?.call_chains?.length"
-          title="调用链分析"
-          embedded
-          class="section-card"
-        >
-          <n-list hoverable>
-            <n-list-item v-for="(chain, index) in jiraResult.code_context.call_chains" :key="index">
-              <template #header>
-                <n-text strong>{{ chain.api_path }}</n-text>
+              <template v-if="traceSummary.success">
+                <div class="trace-grid">
+                  <div class="signal-item">
+                    <span>涉及服务</span>
+                    <strong>{{ traceSummary.services?.length || 0 }} 个</strong>
+                    <p>{{ serviceText }}</p>
+                  </div>
+                  <div class="signal-item">
+                    <span>最慢节点</span>
+                    <strong>{{ slowestNodeText }}</strong>
+                    <p>{{ slowestNodeCost }}</p>
+                  </div>
+                  <div class="signal-item">
+                    <span>异常节点</span>
+                    <strong>{{ traceSummary.has_error ? '有' : '未识别到' }}</strong>
+                    <p>{{ errorNodeText }}</p>
+                  </div>
+                  <div class="signal-item">
+                    <span>SQL</span>
+                    <strong>{{ traceSummary.has_sql ? `${traceSummary.sql_count || 0} 条` : '无' }}</strong>
+                    <p>{{ traceSummary.has_sql ? '已整理可读 SQL' : '链路中未发现 SQL' }}</p>
+                  </div>
+                </div>
+
+                <template v-if="traceSummary.sql?.length">
+                  <div class="sql-list">
+                    <h4>可读 SQL</h4>
+                    <div v-for="(item, index) in traceSummary.sql" :key="item.rid || index" class="sql-item">
+                      <div class="sql-meta">
+                        <n-tag size="small">{{ item.service_name || 'Unknown' }}</n-tag>
+                        <span v-if="item.duration_ms">{{ item.duration_ms }}ms</span>
+                      </div>
+                      <pre>{{ item.sql }}</pre>
+                    </div>
+                  </div>
+                </template>
               </template>
-              <tree-view :data="chain.call_chain.call_chain" />
-            </n-list-item>
-          </n-list>
+            </template>
+            <n-empty v-else description="未提供 Trace ID，暂无链路日志分析" />
+          </section>
+
+          <section class="card-section">
+            <h3>可能原因 Top 3</h3>
+            <template v-if="topCauses.length">
+              <n-list>
+                <n-list-item v-for="(cause, index) in topCauses" :key="index">
+                  <div class="cause-block">
+                    <div class="cause-title">
+                      <n-tag type="warning" size="small">Top {{ index + 1 }}</n-tag>
+                      <strong>{{ cause.category || '待判断原因' }}</strong>
+                    </div>
+                    <p v-if="cause.analysis">{{ cause.analysis }}</p>
+                    <p v-if="cause.suggestion" class="muted-text">{{ cause.suggestion }}</p>
+                    <template v-if="cause.evidence_files?.length">
+                      <div class="evidence-box">
+                        <span>证据</span>
+                        <n-ul>
+                          <n-li v-for="file in cause.evidence_files.slice(0, 3)" :key="file.file_path">
+                            {{ getEvidenceTitle(file.file_path) }}
+                          </n-li>
+                        </n-ul>
+                      </div>
+                    </template>
+                  </div>
+                </n-list-item>
+              </n-list>
+            </template>
+            <n-empty v-else description="暂未形成明确原因，请补充更多上下文" />
+          </section>
+
+          <section class="card-section">
+            <h3>下一步建议</h3>
+            <n-ul>
+              <n-li v-for="item in nextActions" :key="item">{{ item }}</n-li>
+            </n-ul>
+          </section>
+
+          <section class="card-section">
+            <h3>信息缺口</h3>
+            <n-ul>
+              <n-li v-for="item in informationGaps" :key="item">{{ item }}</n-li>
+            </n-ul>
+          </section>
         </n-card>
 
-        <!-- Trace Data Section -->
-        <n-card
-          v-if="jiraResult.code_context?.trace_data"
-          title="链路追踪数据"
-          embedded
-          class="section-card"
-        >
-          <n-descriptions label-placement="top" :column="2">
-            <n-descriptions-item label="Trace ID">
-              <n-space>
-                <n-text>{{ jiraResult.code_context.trace_data.trace_id }}</n-text>
-                <n-button
-                  size="tiny"
-                  tag="a"
-                  :href="'https://devops.souche-inc.com/#/optimus/log'"
-                  target="_blank"
-                  type="primary"
-                >
-                  日志平台
-                </n-button>
-              </n-space>
-            </n-descriptions-item>
-            <n-descriptions-item label="Span 数量">
-              {{ jiraResult.code_context.trace_data.span_count }}
-            </n-descriptions-item>
-            <n-descriptions-item label="包含 SQL">
-              {{ jiraResult.code_context.trace_data.has_sql ? '是' : '否' }}
-            </n-descriptions-item>
-          </n-descriptions>
+        <n-card title="人工反馈" embedded class="section-card">
+          <n-form label-placement="top">
+            <n-grid :cols="2" :x-gap="16" responsive="screen" item-responsive>
+              <n-gi span="1">
+                <n-form-item label="这张卡片是否有帮助">
+                  <n-select
+                    v-model:value="feedbackForm.helpful"
+                    :options="yesNoOptions"
+                    placeholder="请选择"
+                  />
+                </n-form-item>
+              </n-gi>
+              <n-gi span="1">
+                <n-form-item label="是否命中最终根因">
+                  <n-select
+                    v-model:value="feedbackForm.hitRootCause"
+                    :options="yesNoOptions"
+                    placeholder="请选择"
+                  />
+                </n-form-item>
+              </n-gi>
+            </n-grid>
+            <n-form-item label="实际根因">
+              <n-input
+                v-model:value="feedbackForm.rootCause"
+                placeholder="人工确认后的真实原因"
+              />
+            </n-form-item>
+            <n-form-item label="备注">
+              <n-input
+                v-model:value="feedbackForm.note"
+                type="textarea"
+                placeholder="补充这次卡片哪里有用、哪里不够"
+                :autosize="{ minRows: 2, maxRows: 4 }"
+              />
+            </n-form-item>
+            <n-space justify="end">
+              <n-button type="primary" @click="saveFeedback">保存反馈</n-button>
+            </n-space>
+          </n-form>
+          <n-alert v-if="savedFeedback" type="success" title="反馈已记录" style="margin-top: 16px">
+            已记录本次人工判断：{{ savedFeedback.saved_at }}
+          </n-alert>
         </n-card>
       </template>
 
-      <n-empty v-else description="暂无分析结果" />
+      <n-empty v-else description="暂无初筛卡片" />
     </n-spin>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, reactive } from 'vue'
 import { useAnalyzerStore } from '../stores/analyzer'
-import TreeView from './TreeView.vue'
-import GraphView from './GraphView.vue'
 
 const store = useAnalyzerStore()
 
 const loading = computed(() => store.loading)
 const jiraResult = computed(() => store.jiraResult)
+const requestContext = computed(() => jiraResult.value?.request_context || store.lastJiraRequest || {})
+const savedFeedback = computed(() => store.feedback)
 
-function getStatusType(status) {
-  const statusMap = {
-    'Open': 'warning',
-    'In Progress': 'info',
-    'Resolved': 'success',
-    'Closed': 'default'
+const feedbackForm = reactive({
+  helpful: null,
+  hitRootCause: null,
+  rootCause: '',
+  note: ''
+})
+
+const yesNoOptions = [
+  { label: '是', value: '是' },
+  { label: '否', value: '否' },
+  { label: '不确定', value: '不确定' }
+]
+
+const topCauses = computed(() =>
+  (jiraResult.value?.analysis?.possible_causes || []).slice(0, 3)
+)
+
+const traceSummary = computed(() => jiraResult.value?.code_context?.trace_data || null)
+
+const displayTraceId = computed(() =>
+  traceSummary.value?.trace_id || requestContext.value.trace_id || '未提供'
+)
+
+const evidenceCount = computed(() => {
+  const files = jiraResult.value?.code_context?.files?.length || 0
+  const chains = jiraResult.value?.code_context?.call_chains?.length || 0
+  const trace = jiraResult.value?.code_context?.trace_data ? 1 : 0
+  return files + chains + trace
+})
+
+const hasSqlText = computed(() => {
+  const trace = traceSummary.value
+  if (!trace) return '未提供'
+  return trace.has_sql ? '有' : '无'
+})
+
+const serviceText = computed(() => {
+  const services = traceSummary.value?.services || []
+  return services.length ? services.join('、') : '未识别到服务'
+})
+
+const slowestNodeText = computed(() => {
+  const node = traceSummary.value?.slowest_node
+  if (!node) return '未识别'
+  return node.service_name || 'Unknown'
+})
+
+const slowestNodeCost = computed(() => {
+  const node = traceSummary.value?.slowest_node
+  if (!node) return '暂无耗时'
+  return `${node.operation_name || 'Unknown'}，${node.duration_ms || 0}ms`
+})
+
+const errorNodeText = computed(() => {
+  const nodes = traceSummary.value?.error_nodes || []
+  if (!nodes.length) return '未发现明确异常标记'
+  const node = nodes[0]
+  return `${node.service_name || 'Unknown'}：${node.operation_name || 'Unknown'}`
+})
+
+const traceFailureReason = computed(() =>
+  traceSummary.value?.failure_reason || traceSummary.value?.error || 'Trace 获取失败'
+)
+
+const timeWindowText = computed(() => {
+  const window = requestContext.value.time_window
+  if (!window?.start && !window?.end) return '未填写'
+  return `${window.start || '未填写'} 至 ${window.end || '未填写'}`
+})
+
+const timelineItems = computed(() => {
+  const jira = jiraResult.value?.jira || {}
+  const items = [
+    { label: '问题创建', value: formatDate(jira.created) || 'Jira 未返回创建时间' },
+    { label: '排查窗口开始', value: requestContext.value.time_window?.start || '未填写' },
+    { label: '排查窗口结束', value: requestContext.value.time_window?.end || '未填写' }
+  ]
+
+  if (jira.updated) {
+    items.push({ label: '问题最近更新', value: formatDate(jira.updated) })
   }
-  return statusMap[status] || 'default'
-}
+
+  return items
+})
+
+const nextActions = computed(() => {
+  const suggestions = topCauses.value
+    .map(cause => cause.suggestion)
+    .filter(Boolean)
+    .slice(0, 3)
+
+  if (suggestions.length) return suggestions
+
+  return [
+    '补充该时间窗口内的错误日志或 Trace ID',
+    '确认服务范围是否覆盖真实请求链路',
+    '对比问题发生前后的发布记录和关键指标变化'
+  ]
+})
+
+const informationGaps = computed(() => {
+  const gaps = []
+  if (!requestContext.value.trace_id) gaps.push('缺少 Trace ID，链路证据可能不完整')
+  if (!requestContext.value.extra_clues) gaps.push('缺少接口名或错误关键词，原因判断会偏粗')
+  if (!jiraResult.value?.code_context?.trace_data) gaps.push('缺少链路追踪摘要')
+  if (!jiraResult.value?.code_context?.files?.length) gaps.push('缺少相关证据文件或匹配线索')
+  return gaps.length ? gaps : ['当前信息较完整，可由人工继续确认根因']
+})
 
 function formatDate(dateStr) {
   if (!dateStr) return ''
   return new Date(dateStr).toLocaleString()
 }
 
-function getFileName(filePath) {
-  if (!filePath) return ''
+function getEvidenceTitle(filePath) {
+  if (!filePath) return '未命名证据'
   return filePath.split('/').pop()
 }
 
-function formatFileSize(bytes) {
-  if (!bytes) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  while (bytes >= 1024 && i < units.length - 1) {
-    bytes /= 1024
-    i++
-  }
-  return `${bytes.toFixed(1)} ${units[i]}`
+function saveFeedback() {
+  store.saveFeedback({
+    helpful: feedbackForm.helpful,
+    hit_root_cause: feedbackForm.hitRootCause,
+    root_cause: feedbackForm.rootCause,
+    note: feedbackForm.note
+  })
 }
 </script>
 
@@ -217,35 +360,141 @@ function formatFileSize(bytes) {
   margin-bottom: 16px;
 }
 
-.summary-text {
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.card-header h2 {
+  font-size: 18px;
+  line-height: 1.4;
+  margin-top: 10px;
+  font-weight: 600;
+}
+
+.card-section {
+  margin-top: 18px;
+}
+
+.card-section h3 {
+  font-size: 15px;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.trace-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.signal-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 12px;
+  background: #fafafa;
+}
+
+.signal-item span {
+  display: block;
+  color: #667085;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.signal-item strong {
+  font-size: 18px;
+}
+
+.signal-item p {
+  margin-top: 8px;
+  color: #667085;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.sql-list {
+  margin-top: 14px;
+}
+
+.sql-list h4 {
   font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.sql-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 12px;
+  background: #fcfcfd;
+  margin-bottom: 10px;
+}
+
+.sql-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: #667085;
+  margin-bottom: 8px;
+}
+
+.sql-item pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
   line-height: 1.6;
+  color: #344054;
 }
 
-.cause-suggestion {
-  margin-top: 8px;
-  color: var(--n-text-color-2);
+.cause-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.cause-analysis {
-  margin-top: 8px;
-  color: var(--n-text-color-1);
+.cause-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.muted-text {
+  color: #667085;
   white-space: pre-wrap;
 }
 
-.evidence-label {
-  font-size: 12px;
-  color: var(--n-text-color-3);
-  margin-top: 8px;
+.evidence-box {
+  border-left: 3px solid #d0d5dd;
+  padding-left: 10px;
+  color: #475467;
 }
 
-.ascii-view {
-  background: #f5f5f5;
-  padding: 16px;
-  border-radius: 4px;
-  overflow-x: auto;
-  font-family: monospace;
+.evidence-box span {
   font-size: 12px;
-  line-height: 1.4;
+  color: #667085;
+}
+
+@media (max-width: 768px) {
+  .card-header {
+    flex-direction: column;
+  }
+
+  .signal-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .trace-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -6,6 +6,8 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
   const repos = ref([])
   const result = ref(null)
   const jiraResult = ref(null)
+  const lastJiraRequest = ref(null)
+  const feedback = ref(null)
   const loading = ref(false)
   const error = ref(null)
 
@@ -37,6 +39,8 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
     loading.value = true
     error.value = null
     jiraResult.value = null
+    feedback.value = null
+    lastJiraRequest.value = params
 
     try {
       const res = await analyzeJira(params)
@@ -48,5 +52,24 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
     }
   }
 
-  return { repos, result, jiraResult, loading, error, loadRepos, analyze, analyzeJiraIssue }
+  function saveFeedback(payload) {
+    feedback.value = {
+      ...payload,
+      saved_at: new Date().toLocaleString()
+    }
+  }
+
+  return {
+    repos,
+    result,
+    jiraResult,
+    lastJiraRequest,
+    feedback,
+    loading,
+    error,
+    loadRepos,
+    analyze,
+    analyzeJiraIssue,
+    saveFeedback
+  }
 })

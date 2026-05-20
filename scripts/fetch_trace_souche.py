@@ -39,6 +39,7 @@ class TraceFetcher:
         self.endpoint = endpoint
         self.cookies = cookies
         self.verify_ssl = verify_ssl
+        self.last_error = None
 
     def fetch_trace(self, trace_id: str, date: str) -> dict:
         """Fetch trace tree from Souche trace system.
@@ -88,6 +89,7 @@ class TraceFetcher:
         }
 
         req = urllib.request.Request(url, headers=headers)
+        self.last_error = None
 
         if self.cookies:
             req.add_header("Cookie", self.cookies)
@@ -104,17 +106,44 @@ class TraceFetcher:
                     content = response.read().decode('utf-8')
 
             if not content or content.strip() == '':
+                self.last_error = {
+                    "type": "empty_response",
+                    "message": "链路平台返回空内容"
+                }
                 print(f"Warning: Empty response from {url}", file=sys.stderr)
                 return None
 
-            return json.loads(content)
+            result = json.loads(content)
+            if isinstance(result, dict):
+                code = result.get("code") or result.get("status")
+                message = result.get("message") or result.get("msg") or result.get("error")
+                if code not in (None, 0, "0", 200, "200", True) and message:
+                    self.last_error = {
+                        "type": "platform_error",
+                        "message": str(message),
+                        "code": code
+                    }
+            return result
         except urllib.error.HTTPError as e:
+            self.last_error = {
+                "type": "http_error",
+                "message": f"链路平台返回 HTTP {e.code}: {e.reason}",
+                "code": e.code
+            }
             print(f"HTTP Error {e.code}: {e.reason}", file=sys.stderr)
             return None
         except urllib.error.URLError as e:
+            self.last_error = {
+                "type": "network_error",
+                "message": f"无法访问链路平台: {e.reason}"
+            }
             print(f"URL Error: {e.reason}", file=sys.stderr)
             return None
         except json.JSONDecodeError as e:
+            self.last_error = {
+                "type": "invalid_response",
+                "message": "链路平台返回内容不是有效数据"
+            }
             print(f"JSON Decode Error: {e}", file=sys.stderr)
             return None
 

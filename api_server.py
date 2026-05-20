@@ -7,9 +7,11 @@ FastAPI 服务入口
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import os
 from dotenv import load_dotenv
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # 加载 .env 文件
 load_dotenv()
@@ -65,7 +67,12 @@ class AnalyzeJiraRequest(BaseModel):
     trace_id: Optional[str] = None    # Trace ID (可选)
     trace_date: Optional[str] = None  # Trace 日期 (可选)
     cookies: Optional[str] = None     # Trace API 认证 cookies (可选)
-    use_ai: bool = True             # 是否使用 AI 增强 (可选)
+    use_ai: bool = True              # 是否使用 AI 增强 (可选)
+    environment: Optional[str] = None
+    problem_type: Optional[str] = None
+    services: Optional[List[str]] = None
+    time_window: Optional[Dict[str, Any]] = None
+    extra_clues: Optional[str] = None
 
 
 @app.get("/")
@@ -177,6 +184,15 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             cookies=req.cookies,
             use_ai=req.use_ai
         )
+        result["request_context"] = {
+            "environment": req.environment,
+            "time_window": req.time_window,
+            "problem_type": req.problem_type,
+            "services": req.services or [],
+            "extra_clues": req.extra_clues,
+            "trace_id": req.trace_id,
+            "trace_date": req.trace_date
+        }
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

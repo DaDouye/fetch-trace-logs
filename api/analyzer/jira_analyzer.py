@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 # 加载 .env 文件
 load_dotenv()
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from api.jira_client import JiraClient
 from api.analyzer.rule_engine import RuleEngine
@@ -51,7 +52,7 @@ class JiraAnalyzer:
         if repo_path:
             self.repo_path = repo_path
         elif repo_url:
-            self.repo_path = self._clone_or_get_local_repo(repo_url, ref)
+            self.repo_path = self._clone_or_get_local_repo(repo_url, ref) if self._is_repo_url(repo_url) else None
         elif repo_key:
             self.repo_path = self._resolve_repo_path(repo_key)
         else:
@@ -64,6 +65,9 @@ class JiraAnalyzer:
                 # Support both dict and Pydantic model
                 r_url = repo_info.get('repo_url') if isinstance(repo_info, dict) else repo_info.repo_url
                 r_ref = repo_info.get('ref', 'master') if isinstance(repo_info, dict) else getattr(repo_info, 'ref', 'master')
+                if not self._is_repo_url(r_url):
+                    print(f"[JiraAnalyzer] Skipping non-repository input: {r_url}")
+                    continue
                 local_path = self._clone_or_get_local_repo(r_url, r_ref)
                 if local_path:
                     self.multi_repo_paths.append({
@@ -104,6 +108,17 @@ class JiraAnalyzer:
 
         repo_name = repo_url.split('/')[-1].replace('.git', '')
         return os.path.join('./repos', repo_name)
+
+    def _is_repo_url(self, value: str) -> bool:
+        if not value:
+            return False
+        value = value.strip()
+        return (
+            value.startswith("http://")
+            or value.startswith("https://")
+            or value.startswith("git@")
+            or value.startswith("ssh://")
+        )
 
     def _clone_or_get_local_repo(self, repo_url: str, ref: str = "master") -> str:
         """
@@ -256,9 +271,9 @@ class JiraAnalyzer:
         print(f"[CodeContext] api_paths: {api_paths}")
         print(f"[CodeContext] multi_repo_paths: {len(self.multi_repo_paths) if self.multi_repo_paths else 0} repos")
 
-        if not self.repo_path and not self.repo_url and not self.multi_repo_paths:
-            print("[CodeContext] No repo_path or repo_url or repo_urls, returning empty context")
-            return context
+        has_repo_context = bool(self.repo_path or self.repo_url or self.multi_repo_paths)
+        if not has_repo_context:
+            print("[CodeContext] No repository context, code search will be skipped")
 
         # Get keywords from JIRA for search
         issue_full = self.jira_client.get_issue(issue_key)
@@ -302,6 +317,8 @@ class JiraAnalyzer:
             )
             context['files'] = search_results
             print(f"[CodeContext] Search results: {len(search_results)} files")
+        else:
+            print("[CodeContext] Skipping code search because no repository was provided")
 
         # Fetch trace data if trace ID provided
         trace_api_paths = []
@@ -313,14 +330,7 @@ class JiraAnalyzer:
             # Extract API paths from trace data if no api_paths provided
             if not api_paths and trace_data and not trace_data.get('error'):
                 try:
-                    from scripts.fetch_trace_souche import TraceFetcher
-                    verify_ssl = os.getenv("TRACE_VERIFY_SSL", "true").lower() != "false"
-                    fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
-                    trace_full_data = fetcher.fetch_trace(trace_id, trace_date)
-                    print(f"[CodeContext] Trace full data type: {type(trace_full_data)}")
-                    if trace_full_data:
-                        print(f"[CodeContext] Trace full data keys: {trace_full_data.keys() if isinstance(trace_full_data, dict) else 'not a dict'}")
-                    trace_api_paths = TraceFetcher.extract_api_paths(trace_full_data) if trace_full_data else []
+                    trace_api_paths = trace_data.get('api_paths', [])
                     print(f"[CodeContext] Extracted {len(trace_api_paths)} API paths from trace: {trace_api_paths}")
 
                     # Use trace API paths for code search if no other API paths
@@ -402,19 +412,227 @@ class JiraAnalyzer:
         """Fetch trace data from Souche tracing system"""
         try:
             from scripts.fetch_trace_souche import TraceFetcher
-            verify_ssl = os.getenv("TRACE_VERIFY_SSL", "true").lower() != "false"
+            verify_ssl = os.getenv("TRACE_VERIFY_SSL", "false").lower() == "true"
             fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
             trace_data = fetcher.fetch_trace(trace_id, date)
             if trace_data:
-                sql_entries = TraceFetcher.extract_sql_data(trace_data)
-                return {
-                    'trace_id': trace_id,
-                    'span_count': len(sql_entries) if sql_entries else 0,
-                    'has_sql': len(sql_entries) > 0 if sql_entries else False
-                }
+                return self._summarize_trace(trace_id, date, trace_data, fetcher)
+            failure_reason = self._build_trace_failure_reason(trace_id, date, fetcher)
+            return {
+                'trace_id': trace_id,
+                'date': date,
+                'success': False,
+                'error': failure_reason,
+                'failure_reason': failure_reason
+            }
         except Exception as e:
-            return {'error': str(e)}
-        return None
+            return {
+                'trace_id': trace_id,
+                'date': date,
+                'success': False,
+                'error': str(e),
+                'failure_reason': str(e)
+            }
+
+    def _build_trace_failure_reason(self, trace_id: str, date: str, fetcher) -> str:
+        inferred_time = self._infer_trace_time(trace_id)
+        date_hint = f"Trace ID 时间约为 {inferred_time}。" if inferred_time else ""
+        last_error = getattr(fetcher, 'last_error', None)
+
+        if last_error:
+            message = last_error.get('message') or '链路平台未返回有效数据'
+            if last_error.get('type') in {'http_error', 'network_error', 'invalid_response'}:
+                return f"{message} {date_hint}".strip()
+            if last_error.get('type') == 'empty_response':
+                return f"链路平台返回空数据。{date_hint}请确认登录凭证是否有效、是否有该 Trace 的访问权限。"
+            return f"{message} {date_hint}".strip()
+
+        return f"未获取到 Trace 数据。{date_hint}请确认 Trace ID、日期、登录凭证和访问权限。"
+
+    def _infer_trace_time(self, trace_id: str) -> Optional[str]:
+        match = re.match(r'(\d{13})', trace_id or '')
+        if not match:
+            return None
+        try:
+            from datetime import datetime, timezone, timedelta
+            ts = int(match.group(1)) / 1000
+            return datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+
+    def _summarize_trace(self, trace_id: str, date: str, trace_data: Dict[str, Any], fetcher) -> Dict[str, Any]:
+        from scripts.fetch_trace_souche import TraceFetcher
+
+        spans = self._extract_trace_spans(trace_data)
+        if not spans:
+            failure_reason = self._build_trace_failure_reason(trace_id, date, fetcher)
+            return {
+                'trace_id': trace_id,
+                'date': date,
+                'success': False,
+                'error': failure_reason,
+                'failure_reason': failure_reason,
+                'raw_status': {
+                    'has_response': True,
+                    'response_keys': list(trace_data.keys()) if isinstance(trace_data, dict) else []
+                }
+            }
+
+        sql_entries = TraceFetcher.extract_sql_data(trace_data)
+        api_paths = TraceFetcher.extract_api_paths(trace_data)
+        services = sorted({
+            span.get('service_name')
+            for span in spans
+            if span.get('service_name') and span.get('service_name') != 'Unknown'
+        })
+        error_spans = [span for span in spans if span.get('has_error')]
+        slowest_span = max(spans, key=lambda span: span.get('duration_ms') or 0, default=None)
+        readable_sql = self._build_readable_sql(sql_entries, fetcher)
+
+        return {
+            'trace_id': trace_id,
+            'date': date,
+            'success': True,
+            'span_count': len(spans),
+            'services': services,
+            'slowest_node': slowest_span,
+            'has_error': bool(error_spans),
+            'error_nodes': error_spans[:5],
+            'has_sql': bool(sql_entries),
+            'sql_count': len(sql_entries),
+            'sql': readable_sql,
+            'api_paths': api_paths,
+            'evidence_summary': self._build_trace_evidence_summary(
+                spans, services, slowest_span, error_spans, readable_sql
+            )
+        }
+
+    def _extract_trace_spans(self, trace_data: Any) -> List[Dict[str, Any]]:
+        spans = []
+
+        def as_ms(value):
+            try:
+                number = float(value or 0)
+            except (TypeError, ValueError):
+                return 0
+            return round(number, 2)
+
+        def has_error(node):
+            error_fields = [
+                node.get('errtag'),
+                node.get('error'),
+                node.get('exception'),
+                node.get('status'),
+                node.get('result')
+            ]
+            text = ' '.join(str(item) for item in error_fields if item)
+            return bool(text and re.search(r'error|exception|fail|失败|异常|true', text, re.IGNORECASE))
+
+        def visit(node):
+            if isinstance(node, dict):
+                node_type = node.get('type')
+                service_name = node.get('app') or node.get('serviceName') or node.get('service') or 'Unknown'
+                operation_name = node.get('path') or node.get('operationName') or node.get('name') or node_type or 'Unknown'
+                duration = node.get('cost') if node.get('cost') is not None else node.get('duration')
+
+                if node_type or node.get('rid') or node.get('spanId') or node.get('operationName'):
+                    spans.append({
+                        'id': node.get('rid') or node.get('spanId') or node.get('id'),
+                        'service_name': service_name,
+                        'operation_name': operation_name,
+                        'type': node_type or 'unknown',
+                        'duration_ms': as_ms(duration),
+                        'time': node.get('time') or node.get('timestamp') or '',
+                        'has_error': has_error(node)
+                    })
+
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(trace_data)
+        return spans
+
+    def _build_readable_sql(self, sql_entries: List[Dict[str, Any]], fetcher) -> List[Dict[str, Any]]:
+        readable = []
+        seen = set()
+
+        for entry in sql_entries[:10]:
+            rid = entry.get('rid') or entry.get('id')
+            sql_text = None
+            if rid:
+                try:
+                    detail = fetcher.fetch_sql_detail(rid)
+                    sql_text = self._prettify_sql(fetcher.format_complete_sql(detail))
+                except Exception:
+                    sql_text = None
+
+            if not sql_text:
+                sql_text = self._prettify_sql(
+                    entry.get('sql') or entry.get('path') or entry.get('sqlText') or entry.get('statement')
+                )
+
+            if not sql_text or sql_text in seen:
+                continue
+
+            seen.add(sql_text)
+            readable.append({
+                'rid': rid,
+                'service_name': entry.get('app') or entry.get('serviceName') or 'Unknown',
+                'duration_ms': entry.get('cost') or entry.get('duration') or 0,
+                'sql': sql_text
+            })
+
+        return readable
+
+    def _prettify_sql(self, sql: Optional[str]) -> Optional[str]:
+        if not sql:
+            return None
+
+        text = ' '.join(str(sql).split())
+        keywords = [
+            'SELECT', 'FROM', 'WHERE', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN',
+            'JOIN', 'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'INSERT INTO',
+            'UPDATE', 'DELETE FROM', 'SET', 'VALUES'
+        ]
+
+        for keyword in sorted(keywords, key=len, reverse=True):
+            text = re.sub(rf'\b{keyword}\b', f'\n{keyword}', text, flags=re.IGNORECASE)
+
+        return text.strip()
+
+    def _build_trace_evidence_summary(
+        self,
+        spans: List[Dict[str, Any]],
+        services: List[str],
+        slowest_span: Optional[Dict[str, Any]],
+        error_spans: List[Dict[str, Any]],
+        readable_sql: List[Dict[str, Any]]
+    ) -> str:
+        parts = []
+        parts.append(f"成功获取 Trace，共 {len(spans)} 个节点。")
+        if services:
+            parts.append(f"涉及服务：{', '.join(services[:8])}。")
+        if slowest_span:
+            parts.append(
+                f"最慢节点为 {slowest_span.get('service_name')}.{slowest_span.get('operation_name')}，"
+                f"耗时 {slowest_span.get('duration_ms')}ms。"
+            )
+        if error_spans:
+            first_error = error_spans[0]
+            parts.append(
+                f"发现异常节点：{first_error.get('service_name')}.{first_error.get('operation_name')}。"
+            )
+        else:
+            parts.append("未从链路节点中识别到明确异常标记。")
+        if readable_sql:
+            parts.append(f"链路中包含 SQL，共整理 {len(readable_sql)} 条可读 SQL。")
+        else:
+            parts.append("链路中未发现 SQL。")
+        return ''.join(parts)
 
     def _analyze_causes(self, result: Dict[str, Any], use_ai: bool = False) -> Dict[str, Any]:
         """Analyze JIRA content to identify possible problem causes"""
@@ -440,9 +658,9 @@ class JiraAnalyzer:
         rag_context = None
         if use_ai:
             try:
-                # Get RAG context for enhanced analysis
-                rag_context = self.rag_indexer.get_context_for_analysis(jira, code_context)
-                print(f"[_analyze_causes] RAG context retrieved: {len(rag_context) if rag_context else 0} chars")
+                if os.getenv("RAG_CONTEXT_ENABLED", "false").lower() == "true":
+                    rag_context = self.rag_indexer.get_context_for_analysis(jira, code_context)
+                    print(f"[_analyze_causes] RAG context retrieved: {len(rag_context) if rag_context else 0} chars")
 
                 ai_result = self.ai_analyzer.analyze(jira, code_context, trace_data, rag_context)
                 ai_causes = ai_result.get('possible_causes', [])
