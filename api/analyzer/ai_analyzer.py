@@ -18,6 +18,7 @@ class AIAnalyzer:
         self.api_key = os.getenv('ANTHROPIC_API_KEY')
         self.api_url = os.getenv('ANTHROPIC_API_URL', 'https://api.minimaxi.com/anthropic/v1/messages')
         self.model = os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022')
+        self.verify_ssl = os.getenv('ANTHROPIC_VERIFY_SSL', 'true').lower() != 'false'
 
     def analyze(
         self,
@@ -191,10 +192,10 @@ class AIAnalyzer:
             method='POST'
         )
 
-        # 创建不验证SSL证书的context
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        if not self.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         try:
             with urllib.request.urlopen(req, timeout=300, context=ctx) as response:

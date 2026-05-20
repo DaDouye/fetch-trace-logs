@@ -56,20 +56,79 @@ class CodeSearch:
         if business_terms:
             keywords.extend(business_terms)
 
-        for keyword in keywords:
-            keyword_results = self._search_keyword(
-                keyword,
-                max_results=max_results_per_keyword
-            )
+        keywords = [k for k in dict.fromkeys(keywords) if k]
+        if not keywords or not os.path.exists(self.repo_path):
+            return results
 
-            for result in keyword_results:
-                # Avoid duplicates
-                file_path = result['file_path']
+        result_count_by_keyword = {keyword: 0 for keyword in keywords}
+        lowered_keywords = [(keyword, keyword.lower()) for keyword in keywords]
+
+        for file_path in self._iter_java_files():
+            matches_by_keyword = self._search_keywords_in_file(file_path, lowered_keywords)
+            for keyword, matches in matches_by_keyword.items():
+                if result_count_by_keyword[keyword] >= max_results_per_keyword:
+                    continue
+
+                result_count_by_keyword[keyword] += 1
                 if file_path not in seen_files:
                     seen_files.add(file_path)
-                    results.append(result)
+                    results.append({
+                        'file_path': file_path,
+                        'keyword': keyword,
+                        'matches': matches[:5]
+                    })
+
+            if all(count >= max_results_per_keyword for count in result_count_by_keyword.values()):
+                break
 
         return results
+
+    def _iter_java_files(self):
+        for root, dirs, files in os.walk(self.repo_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+            for file in files:
+                if not file.endswith('.java'):
+                    continue
+
+                file_path = os.path.join(root, file)
+                if self.SEARCH_SCOPE_PATTERN.search(file_path):
+                    yield file_path
+
+    def _search_keywords_in_file(self, file_path: str, keywords: List[tuple]) -> Dict[str, List[Dict[str, Any]]]:
+        matches_by_keyword = {}
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except Exception:
+            return matches_by_keyword
+
+        for line_num, line in enumerate(lines, 1):
+            lower_line = line.lower()
+            for keyword, lowered_keyword in keywords:
+                if lowered_keyword in lower_line:
+                    matches_by_keyword.setdefault(keyword, []).append({
+                        'line_number': line_num,
+                        'content': line.strip(),
+                        'context': self._get_context_from_lines(lines, line_num)
+                    })
+
+        return matches_by_keyword
+
+    def _get_context_from_lines(self, lines: List[str], line_num: int, context_lines: int = 2) -> List[Dict]:
+        context = []
+        start = max(0, line_num - context_lines - 1)
+        end = min(len(lines), line_num + context_lines)
+
+        for i in range(start, end):
+            context.append({
+                'line_number': i + 1,
+                'content': lines[i].strip(),
+                'is_target': i + 1 == line_num
+            })
+
+        return context
 
     def _search_keyword(self, keyword: str, max_results: int = 10) -> List[Dict[str, Any]]:
         """

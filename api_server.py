@@ -26,7 +26,11 @@ app = FastAPI(
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:5173").split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,24 +48,24 @@ class AnalyzeRequest(BaseModel):
     cookies: Optional[str] = None     # 可选，trace API 认证 cookies
 
 
+class RepoInfo(BaseModel):
+    """单个仓库信息"""
+    repo_url: str
+    ref: str = "master"
+
+
 class AnalyzeJiraRequest(BaseModel):
     """JIRA 问题分析请求模型"""
     jira_url: str                    # JIRA URL (必填)
-    repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
-    repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
+    repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_urls 二选一)
+    repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库) - 兼容旧版
     ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
+    repo_urls: Optional[List[RepoInfo]] = None  # Git 仓库 URL 列表 (支持多仓库)
     api_paths: Optional[List[str]] = None  # API 路径列表 (可选)
     trace_id: Optional[str] = None    # Trace ID (可选)
     trace_date: Optional[str] = None  # Trace 日期 (可选)
     cookies: Optional[str] = None     # Trace API 认证 cookies (可选)
     use_ai: bool = True             # 是否使用 AI 增强 (可选)
-
-
-class RepoInfo(BaseModel):
-    """仓库信息模型"""
-    key: str
-    url: str
-    name: str
 
 
 @app.get("/")
@@ -139,9 +143,9 @@ async def analyze_jira(req: AnalyzeJiraRequest):
 
     Request Body:
     - jira_url: JIRA URL (必填)
-    - repo_key: (可选) 仓库键名，与 repo_url 二选一
-    - repo_url: Git 仓库 URL (可选，直接指定远程仓库)
-    - ref: 分支/ commit (默认 main)
+    - repo_key: (可选) 仓库键名，与 repo_urls 二选一
+    - repo_url: Git 仓库 URL (可选，直接指定远程仓库) - 兼容旧版
+    - repo_urls: (可选) Git 仓库 URL 列表，支持多仓库
     - api_path: (可选) API 路径
     - trace_id: (可选) Trace ID
     - trace_date: (可选) Trace 日期
@@ -151,14 +155,17 @@ async def analyze_jira(req: AnalyzeJiraRequest):
     try:
         from api.analyzer.jira_analyzer import JiraAnalyzer
 
-        # 如果提供了 api_paths 但没有 repo_key 和 repo_url，返回错误
-        if req.api_paths and not req.repo_key and not req.repo_url:
+        # 如果提供了 api_paths 但没有任何仓库，返回错误
+        if req.api_paths and not req.repo_key and not req.repo_url and not req.repo_urls:
             raise HTTPException(
                 status_code=400,
-                detail="repo_key or repo_url is required when api_paths is provided"
+                detail="repo_key or repo_url or repo_urls is required when api_paths is provided"
             )
 
-        if req.repo_url:
+        # 支持多仓库
+        if req.repo_urls:
+            analyzer = JiraAnalyzer(repo_urls=req.repo_urls)
+        elif req.repo_url:
             analyzer = JiraAnalyzer(repo_url=req.repo_url, ref=req.ref)
         else:
             analyzer = JiraAnalyzer(repo_key=req.repo_key)

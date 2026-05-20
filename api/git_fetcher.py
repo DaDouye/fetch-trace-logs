@@ -30,11 +30,19 @@ class GitFetcher:
         """
         self.repo_url = repo_url
         self.ref = ref
+        self.verify_ssl = os.getenv("GIT_FETCHER_VERIFY_SSL", "true").lower() != "false"
         self._cache: Dict[str, bytes] = {}  # path -> content
         self._list_cache: Dict[str, List[str]] = {}  # dir -> files
 
         # 检测仓库类型
         self._repo_type = self._detect_repo_type()
+
+    def _ssl_context(self):
+        ctx = ssl.create_default_context()
+        if not self.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
     def _detect_repo_type(self) -> str:
         """检测仓库类型：github, gitlab, 或 generic"""
@@ -93,12 +101,13 @@ class GitFetcher:
         :param ref: 分支或 commit
         :return: 文件路径列表
         """
-        if directory in self._list_cache:
-            return self._list_cache[directory]
+        key = self._get_cache_key(directory, ref)
+        if key in self._list_cache:
+            return self._list_cache[key]
 
         files = self._list_directory(directory, ref)
         if files is not None:
-            self._list_cache[directory] = files
+            self._list_cache[key] = files
         return files
 
     def _fetch_file(self, file_path: str, ref: str = None) -> Optional[bytes]:
@@ -178,11 +187,7 @@ class GitFetcher:
 
         try:
             req = urllib.request.Request(api_url + params, headers=headers)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+            with urllib.request.urlopen(req, timeout=30, context=self._ssl_context()) as response:
                 return response.read()
 
         except urllib.error.HTTPError as e:
@@ -212,11 +217,7 @@ class GitFetcher:
 
         try:
             req = urllib.request.Request(api_url, headers=headers)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+            with urllib.request.urlopen(req, timeout=30, context=self._ssl_context()) as response:
                 return response.read()
 
         except urllib.error.HTTPError as e:
@@ -256,11 +257,7 @@ class GitFetcher:
 
         try:
             req = urllib.request.Request(api_url, headers=headers)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+            with urllib.request.urlopen(req, timeout=30, context=self._ssl_context()) as response:
                 import json
                 items = json.loads(response.read().decode('utf-8'))
                 return [item['path'] for item in items if item['type'] == 'file']
@@ -282,11 +279,7 @@ class GitFetcher:
 
         try:
             req = urllib.request.Request(api_url, headers=headers)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
+            with urllib.request.urlopen(req, timeout=30, context=self._ssl_context()) as response:
                 import json
                 items = json.loads(response.read().decode('utf-8'))
                 return [item['path'] for item in items if item['type'] == 'blob']

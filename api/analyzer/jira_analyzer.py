@@ -4,6 +4,8 @@ JIRA Problem Analyzer - Unified analysis orchestration
 """
 
 import os
+import hashlib
+import re
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -29,6 +31,7 @@ class JiraAnalyzer:
         repo_key: str = None,
         repo_path: str = None,
         repo_url: str = None,
+        repo_urls: List[Dict[str, str]] = None,
         ref: str = "master"
     ):
         """
@@ -37,18 +40,57 @@ class JiraAnalyzer:
         :param repo_key: Repository key from config
         :param repo_path: Direct repository path (alternative to repo_key)
         :param repo_url: Remote Git URL (alternative to repo_key)
+        :param repo_urls: List of Git URLs (alternative to repo_key, supports multiple repos)
         :param ref: Git branch/commit (used with repo_url)
         """
         self.repo_key = repo_key
-        self.repo_path = repo_path
         self.repo_url = repo_url
         self.ref = ref
+        self.repo_urls = repo_urls  # List of {repo_url, ref} dicts
+
+        if repo_path:
+            self.repo_path = repo_path
+        elif repo_url:
+            self.repo_path = self._clone_or_get_local_repo(repo_url, ref)
+        elif repo_key:
+            self.repo_path = self._resolve_repo_path(repo_key)
+        else:
+            self.repo_path = None
+
+        # If repo_urls is provided (multiple repos), clone all to local
+        self.multi_repo_paths = []
+        if self.repo_urls:
+            for repo_info in self.repo_urls:
+                # Support both dict and Pydantic model
+                r_url = repo_info.get('repo_url') if isinstance(repo_info, dict) else repo_info.repo_url
+                r_ref = repo_info.get('ref', 'master') if isinstance(repo_info, dict) else getattr(repo_info, 'ref', 'master')
+                local_path = self._clone_or_get_local_repo(r_url, r_ref)
+                if local_path:
+                    self.multi_repo_paths.append({
+                        'repo_url': r_url,
+                        'ref': r_ref,
+                        'local_path': local_path
+                    })
+            print(f"[JiraAnalyzer] Initialized with {len(self.multi_repo_paths)} repos")
 
         self.jira_client = JiraClient()
         self.rule_engine = RuleEngine()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
-        self.ai_analyzer = AIAnalyzer()
-        self.rag_indexer = LightRAGIndexer()
+        # For multi-repo mode, we don't use single code_search but search each repo separately
+        self._ai_analyzer = None
+        self._rag_indexer = None
+
+    @property
+    def ai_analyzer(self) -> AIAnalyzer:
+        if self._ai_analyzer is None:
+            self._ai_analyzer = AIAnalyzer()
+        return self._ai_analyzer
+
+    @property
+    def rag_indexer(self) -> LightRAGIndexer:
+        if self._rag_indexer is None:
+            self._rag_indexer = LightRAGIndexer()
+        return self._rag_indexer
 
     def _resolve_repo_path(self, repo_key: str = None) -> Optional[str]:
         """Resolve repository path from key or return None"""
@@ -62,6 +104,48 @@ class JiraAnalyzer:
 
         repo_name = repo_url.split('/')[-1].replace('.git', '')
         return os.path.join('./repos', repo_name)
+
+    def _clone_or_get_local_repo(self, repo_url: str, ref: str = "master") -> str:
+        """
+        Clone remote repository or get existing local repository path
+
+        :param repo_url: Remote repository URL
+        :return: Local repository path
+        """
+        import git
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        safe_ref = re.sub(r'[^A-Za-z0-9_.-]+', '_', ref or 'master')
+        repo_hash = hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:8]
+        local_path = os.path.join('./repos', f"{repo_name}-{safe_ref}-{repo_hash}")
+
+        # Check if local repo exists
+        if os.path.exists(local_path):
+            print(f"[JiraAnalyzer] Repo already exists: {local_path}, pulling...")
+            try:
+                existing_repo = git.Repo(local_path)
+                existing_repo.remotes.origin.fetch(ref)
+                self._checkout_ref(existing_repo, ref)
+            except Exception as e:
+                print(f"[JiraAnalyzer] Pull failed: {e}, will use existing")
+        else:
+            print(f"[JiraAnalyzer] Cloning repo: {repo_url} ({ref})")
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            try:
+                repo = git.Repo.clone_from(repo_url, local_path)
+                self._checkout_ref(repo, ref)
+            except Exception as e:
+                print(f"[JiraAnalyzer] Clone failed: {e}")
+                return None
+
+        return local_path
+
+    def _checkout_ref(self, repo, ref: str):
+        if not ref:
+            return
+        try:
+            repo.git.checkout(ref)
+        except Exception:
+            repo.git.checkout("FETCH_HEAD")
 
     def analyze(
         self,
@@ -170,9 +254,10 @@ class JiraAnalyzer:
         print(f"[CodeContext] repo_path: {self.repo_path}")
         print(f"[CodeContext] repo_key: {self.repo_key}")
         print(f"[CodeContext] api_paths: {api_paths}")
+        print(f"[CodeContext] multi_repo_paths: {len(self.multi_repo_paths) if self.multi_repo_paths else 0} repos")
 
-        if not self.repo_path and not self.repo_url:
-            print("[CodeContext] No repo_path or repo_url, returning empty context")
+        if not self.repo_path and not self.repo_url and not self.multi_repo_paths:
+            print("[CodeContext] No repo_path or repo_url or repo_urls, returning empty context")
             return context
 
         # Get keywords from JIRA for search
@@ -186,7 +271,29 @@ class JiraAnalyzer:
         if not search_api_paths:
             search_api_paths = []
 
-        if self.code_search:
+        # Multi-repo mode: search each repo and merge results
+        if self.multi_repo_paths:
+            all_search_results = []
+            for repo_info in self.multi_repo_paths:
+                local_path = repo_info.get('local_path')
+                repo_url = repo_info.get('repo_url')
+                print(f"[CodeContext] Searching repo: {repo_url}, path: {local_path}")
+                code_search = CodeSearch(local_path) if local_path else None
+                if code_search:
+                    search_results = code_search.search(
+                        api_paths=search_api_paths,
+                        class_names=keywords.get('class_names', []),
+                        error_patterns=keywords.get('error_patterns', []),
+                        business_terms=keywords.get('business_terms', [])
+                    )
+                    # Add repo_url to each result for tracking source
+                    for result in search_results:
+                        result['repo_url'] = repo_url
+                    all_search_results.extend(search_results)
+                    print(f"[CodeContext] Search results from {repo_url}: {len(search_results)} files")
+            context['files'] = all_search_results
+            print(f"[CodeContext] Total search results from all repos: {len(all_search_results)} files")
+        elif self.code_search:
             search_results = self.code_search.search(
                 api_paths=search_api_paths,
                 class_names=keywords.get('class_names', []),
@@ -207,7 +314,8 @@ class JiraAnalyzer:
             if not api_paths and trace_data and not trace_data.get('error'):
                 try:
                     from scripts.fetch_trace_souche import TraceFetcher
-                    fetcher = TraceFetcher(cookies=cookies, verify_ssl=False)
+                    verify_ssl = os.getenv("TRACE_VERIFY_SSL", "true").lower() != "false"
+                    fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
                     trace_full_data = fetcher.fetch_trace(trace_id, trace_date)
                     print(f"[CodeContext] Trace full data type: {type(trace_full_data)}")
                     if trace_full_data:
@@ -217,14 +325,33 @@ class JiraAnalyzer:
 
                     # Use trace API paths for code search if no other API paths
                     if not search_api_paths and trace_api_paths:
-                        search_results = self.code_search.search(
-                            api_paths=trace_api_paths,
-                            class_names=keywords.get('class_names', []),
-                            error_patterns=keywords.get('error_patterns', []),
-                            business_terms=keywords.get('business_terms', [])
-                        )
-                        context['files'] = search_results
-                        print(f"[CodeContext] Search results from trace API paths: {len(search_results)} files")
+                        if self.multi_repo_paths:
+                            # Multi-repo: search each repo
+                            all_search_results = []
+                            for repo_info in self.multi_repo_paths:
+                                local_path = repo_info.get('local_path')
+                                repo_url = repo_info.get('repo_url')
+                                code_search = CodeSearch(local_path) if local_path else None
+                                if code_search:
+                                    search_results = code_search.search(
+                                        api_paths=trace_api_paths,
+                                        class_names=keywords.get('class_names', []),
+                                        error_patterns=keywords.get('error_patterns', []),
+                                        business_terms=keywords.get('business_terms', [])
+                                    )
+                                    for result in search_results:
+                                        result['repo_url'] = repo_url
+                                    all_search_results.extend(search_results)
+                            context['files'] = all_search_results
+                        elif self.code_search:
+                            search_results = self.code_search.search(
+                                api_paths=trace_api_paths,
+                                class_names=keywords.get('class_names', []),
+                                error_patterns=keywords.get('error_patterns', []),
+                                business_terms=keywords.get('business_terms', [])
+                            )
+                            context['files'] = search_results
+                        print(f"[CodeContext] Search results from trace API paths: {len(context['files'])} files")
                 except Exception as e:
                     print(f"[CodeContext] Failed to extract API paths from trace: {e}")
 
@@ -246,14 +373,19 @@ class JiraAnalyzer:
 
     def _analyze_call_chain(self, api_path: str) -> Optional[Dict[str, Any]]:
         """Perform call chain analysis using existing analyzer"""
-        if not self.repo_key and not self.repo_url:
-            print(f"[CallChain] No repo_key or repo_url, skipping call chain analysis for {api_path}")
+        if not self.repo_key and not self.repo_url and not self.multi_repo_paths:
+            print(f"[CallChain] No repo_key or repo_url or repo_urls, skipping call chain analysis for {api_path}")
             return None
 
         try:
             from api.analyze import JavaCallChainAnalyzer
             print(f"[CallChain] Analyzing call chain for: {api_path}")
-            if self.repo_url:
+
+            # Multi-repo mode: analyze first repo (call chain analysis is typically repo-specific)
+            if self.multi_repo_paths:
+                repo_info = self.multi_repo_paths[0]
+                analyzer = JavaCallChainAnalyzer(repo_url=repo_info.get('repo_url'), ref=repo_info.get('ref', 'master'))
+            elif self.repo_url:
                 analyzer = JavaCallChainAnalyzer(repo_url=self.repo_url, ref=self.ref)
             else:
                 analyzer = JavaCallChainAnalyzer(repo_key=self.repo_key)
@@ -270,7 +402,8 @@ class JiraAnalyzer:
         """Fetch trace data from Souche tracing system"""
         try:
             from scripts.fetch_trace_souche import TraceFetcher
-            fetcher = TraceFetcher(cookies=cookies, verify_ssl=False)
+            verify_ssl = os.getenv("TRACE_VERIFY_SSL", "true").lower() != "false"
+            fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
             trace_data = fetcher.fetch_trace(trace_id, date)
             if trace_data:
                 sql_entries = TraceFetcher.extract_sql_data(trace_data)
@@ -345,22 +478,19 @@ class JiraAnalyzer:
                     'confidence': 0.5
                 })
 
-        # Index data for future RAG retrieval (after successful analysis)
-        try:
-            # Index JIRA issue
-            self.rag_indexer.index_jira_issue(jira.get('key', ''), jira)
-            # Index code files
-            if code_context.get('files'):
-                self.rag_indexer.index_code_files(code_context['files'])
-            # Index trace data
-            trace_data_for_index = code_context.get('trace_data')
-            if trace_data_for_index and not trace_data_for_index.get('error'):
-                self.rag_indexer.index_trace_data(
-                    trace_data_for_index.get('trace_id', ''),
-                    trace_data_for_index
-                )
-        except Exception as e:
-            print(f"[_analyze_causes] RAG indexing error: {e}")
+        if os.getenv("RAG_AUTO_INDEX", "false").lower() == "true":
+            try:
+                self.rag_indexer.index_jira_issue(jira.get('key', ''), jira)
+                if code_context.get('files'):
+                    self.rag_indexer.index_code_files(code_context['files'])
+                trace_data_for_index = code_context.get('trace_data')
+                if trace_data_for_index and not trace_data_for_index.get('error'):
+                    self.rag_indexer.index_trace_data(
+                        trace_data_for_index.get('trace_id', ''),
+                        trace_data_for_index
+                    )
+            except Exception as e:
+                print(f"[_analyze_causes] RAG indexing error: {e}")
 
         return {
             'possible_causes': causes,
@@ -397,8 +527,12 @@ class JiraAnalyzer:
             matching_files = []
             for pattern in cause.get('keywords', []):
                 for result in search_results:
-                    if any(pattern.lower() in f.get('file_path', '').lower()
-                           for f in search_results):
+                    file_path = result.get('file_path', '').lower()
+                    match_text = ' '.join(
+                        match.get('content', '')
+                        for match in result.get('matches', [])
+                    ).lower()
+                    if pattern.lower() in file_path or pattern.lower() in match_text:
                         matching_files.append(result)
 
             if matching_files:

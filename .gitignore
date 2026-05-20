@@ -1,3 +1,30 @@
 .DS_Store
 .qoder/
 .venv
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+.env
+.config
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Generated analysis data
+lightrag_data/
+repos/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+tmp/
+temp/

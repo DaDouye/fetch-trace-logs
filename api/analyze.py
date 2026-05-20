@@ -649,7 +649,8 @@ class JavaCallChainAnalyzer:
         """获取运行时 Trace 数据"""
         try:
             from scripts.fetch_trace_souche import TraceFetcher
-            fetcher = TraceFetcher(cookies=cookies, verify_ssl=False)
+            verify_ssl = os.getenv("TRACE_VERIFY_SSL", "true").lower() != "false"
+            fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
             trace_data = fetcher.fetch_trace(trace_id, date)
             if trace_data:
                 sql_entries = TraceFetcher.extract_sql_data(trace_data)

@@ -18,12 +18,18 @@ load_dotenv()
 
 try:
     from langchain_community.vectorstores import FAISS
-    from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain.schema import Document
 except ImportError:
     FAISS = None
-    HuggingFaceEmbeddings = None
     Document = None
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:
+    try:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+    except ImportError:
+        HuggingFaceEmbeddings = None
 
 
 class LightRAGIndexer:
@@ -46,6 +52,7 @@ class LightRAGIndexer:
         self.storage_path = storage_path
         self.embedding_model = os.getenv("MINIMAXI_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         self.embedding_api_url = os.getenv("MINIMAXI_EMBEDDING_API_URL", "https://api.minimaxi.com/embedding")
+        self.trust_local_index = os.getenv("LIGHTRAG_TRUST_LOCAL_INDEX", "false").lower() == "true"
 
         # Initialize embeddings (using HuggingFace local model as primary)
         if HuggingFaceEmbeddings:
@@ -61,7 +68,7 @@ class LightRAGIndexer:
         os.makedirs(self.storage_path, exist_ok=True)
         index_file = os.path.join(self.storage_path, "faiss_index")
 
-        if os.path.exists(index_file) and self.embeddings:
+        if os.path.exists(index_file) and self.embeddings and self.trust_local_index:
             try:
                 self.vector_store = FAISS.load_local(
                     index_file,
@@ -72,6 +79,8 @@ class LightRAGIndexer:
             except Exception as e:
                 print(f"[LightRAG] Failed to load index: {e}, creating new one")
                 self.vector_store = None
+        elif os.path.exists(index_file) and self.embeddings:
+            print("[LightRAG] Existing index skipped. Set LIGHTRAG_TRUST_LOCAL_INDEX=true to load it.")
 
         if self.vector_store is None and self.embeddings:
             # Create empty vector store with a placeholder

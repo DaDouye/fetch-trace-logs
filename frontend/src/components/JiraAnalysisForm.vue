@@ -14,21 +14,14 @@
       </n-grid>
 
       <n-grid :cols="2" :x-gap="16" responsive="screen" item-responsive>
-        <n-gi span="1">
-          <n-form-item label="Git 地址" path="repoUrl">
-            <n-input
-              v-model:value="formValue.repoUrl"
-              placeholder="如: https://github.com/user/repo.git"
-              clearable
-            />
-          </n-form-item>
-        </n-gi>
-        <n-gi span="1">
-          <n-form-item label="分支 (可选，默认 main)" path="ref">
-            <n-input
-              v-model:value="formValue.ref"
-              placeholder="main"
-              clearable
+        <n-gi span="2">
+          <n-form-item label="Git 地址" path="repoUrls">
+            <n-dynamic-input
+              v-model:value="formValue.repoUrls"
+              :min="1"
+              preset="pair"
+              key-placeholder="仓库URL"
+              value-placeholder="分支，默认master"
             />
           </n-form-item>
         </n-gi>
@@ -96,8 +89,7 @@ const store = useAnalyzerStore()
 const formRef = ref(null)
 const formValue = ref({
   jiraUrl: '',
-  repoUrl: '',
-  ref: 'master',
+  repoUrls: [{ key: '', value: 'master' }],
   traceId: '',
   traceDate: null,
   cookies: ''
@@ -118,8 +110,15 @@ function handleAnalyze() {
       jira_url: formValue.value.jiraUrl.trim()
     }
 
-    if (formValue.value.repoUrl) params.repo_url = formValue.value.repoUrl.trim()
-    if (formValue.value.ref) params.ref = formValue.value.ref
+    // 处理多仓库
+    const validRepos = formValue.value.repoUrls.filter(r => r.key && r.key.trim())
+    if (validRepos.length > 0) {
+      params.repo_urls = validRepos.map(r => ({
+        repo_url: r.key.trim(),
+        ref: r.value?.trim() || 'master'
+      }))
+    }
+
     if (formValue.value.traceId) params.trace_id = formValue.value.traceId
     if (formValue.value.traceDate) {
       const d = new Date(formValue.value.traceDate)

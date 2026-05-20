@@ -47,7 +47,7 @@ pip install -r requirements.txt
 
 对于 RAG 功能还需要安装：
 ```bash
-pip install langchain langchain-community faiss-cpu sentence-transformers gitpython
+pip install -r requirements-rag.txt
 ```
 
 ### 前端依赖
