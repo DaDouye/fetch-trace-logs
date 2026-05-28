@@ -133,8 +133,42 @@ class AIAnalyzer:
             prompt += f"- Trace ID: {trace_data.get('trace_id', 'N/A')}\n"
             prompt += f"- Span数量: {trace_data.get('span_count', 0)}\n"
             prompt += f"- 包含SQL: {'是' if trace_data.get('has_sql') else '否'}\n"
+            if trace_data.get('error_nodes'):
+                prompt += "- 异常节点:\n"
+                for node in trace_data.get('error_nodes', [])[:5]:
+                    prompt += (
+                        f"  - {node.get('service_name', 'Unknown')}."
+                        f"{node.get('operation_name', 'Unknown')}: "
+                        f"{str(node.get('error_text', ''))[:200]}\n"
+                    )
+            if trace_data.get('api_paths'):
+                prompt += f"- Trace API: {', '.join(trace_data.get('api_paths', [])[:5])}\n"
         else:
             prompt += "\n### Trace链路数据: 无"
+
+        files = code_context.get('files') or []
+        if files:
+            prompt += "\n\n### 代码搜索命中:\n"
+            for item in files[:8]:
+                prompt += f"- {item.get('file_path')} keyword={item.get('keyword')} source={item.get('source', 'unknown')}\n"
+                for match in (item.get('matches') or [])[:2]:
+                    prompt += f"  L{match.get('line_number')}: {str(match.get('content', ''))[:180]}\n"
+
+        # Add log data
+        log_data = code_context.get('logs')
+        if log_data and log_data.get('success'):
+            prompt += f"\n\n### 日志数据:\n"
+            prompt += f"- 涉及服务: {', '.join(log_data.get('services', []))}\n"
+            prompt += f"- 日志总数: {log_data.get('total_entries', 0)}\n"
+            prompt += f"- ERROR日志: {log_data.get('error_count', 0)}\n"
+            if log_data.get('error_messages'):
+                prompt += f"\n错误日志片段:\n"
+                for i, msg in enumerate(log_data.get('error_messages', [])[:5], 1):
+                    prompt += f"{i}. {msg[:200]}\n"
+            if log_data.get('evidence_summary'):
+                prompt += f"\n日志摘要: {log_data.get('evidence_summary')}\n"
+        else:
+            prompt += "\n### 日志数据: 无"
 
         prompt += """
 

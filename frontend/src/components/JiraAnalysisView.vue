@@ -92,23 +92,21 @@
                   </div>
                   <div class="signal-item">
                     <span>SQL</span>
-                    <strong>{{ traceSummary.has_sql ? `${traceSummary.sql_count || 0} 条` : '无' }}</strong>
+                    <div class="signal-title-row">
+                      <strong>{{ traceSummary.has_sql ? `${traceSummary.sql_count || 0} 条` : '无' }}</strong>
+                      <n-button
+                        v-if="traceSqlList.length"
+                        size="small"
+                        type="primary"
+                        secondary
+                        @click="openSqlDetailPage"
+                      >
+                        查看详情
+                      </n-button>
+                    </div>
                     <p>{{ traceSummary.has_sql ? '已整理可读 SQL' : '链路中未发现 SQL' }}</p>
                   </div>
                 </div>
-
-                <template v-if="traceSummary.sql?.length">
-                  <div class="sql-list">
-                    <h4>可读 SQL</h4>
-                    <div v-for="(item, index) in traceSummary.sql" :key="item.rid || index" class="sql-item">
-                      <div class="sql-meta">
-                        <n-tag size="small">{{ item.service_name || 'Unknown' }}</n-tag>
-                        <span v-if="item.duration_ms">{{ item.duration_ms }}ms</span>
-                      </div>
-                      <pre>{{ item.sql }}</pre>
-                    </div>
-                  </div>
-                </template>
               </template>
             </template>
             <n-empty v-else description="未提供 Trace ID，暂无链路日志分析" />
@@ -239,6 +237,8 @@ const topCauses = computed(() =>
 
 const traceSummary = computed(() => jiraResult.value?.code_context?.trace_data || null)
 
+const traceSqlList = computed(() => traceSummary.value?.sql || [])
+
 const displayTraceId = computed(() =>
   traceSummary.value?.trace_id || requestContext.value.trace_id || '未提供'
 )
@@ -339,6 +339,123 @@ function getEvidenceTitle(filePath) {
   return filePath.split('/').pop()
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function openSqlDetailPage() {
+  const sqlList = traceSqlList.value
+  if (!sqlList.length) return
+
+  const traceId = displayTraceId.value
+  const title = `Trace SQL 详情 - ${traceId}`
+  const rows = sqlList.map((item, index) => {
+    const service = escapeHtml(item.service_name || 'Unknown')
+    const duration = item.duration_ms ? `${escapeHtml(item.duration_ms)}ms` : '暂无耗时'
+    const rid = item.rid ? escapeHtml(item.rid) : `SQL-${index + 1}`
+    const sql = escapeHtml(item.sql || '未获取到 SQL 内容')
+    return `
+      <article class="sql-item">
+        <div class="sql-meta">
+          <span class="index">#${index + 1}</span>
+          <span>${service}</span>
+          <span>${duration}</span>
+          <span>${rid}</span>
+        </div>
+        <pre>${sql}</pre>
+      </article>
+    `
+  }).join('')
+
+  const html = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f6f7f9;
+      color: #1f2937;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .header {
+      margin-bottom: 18px;
+    }
+    h1 {
+      font-size: 22px;
+      margin: 0 0 8px;
+      font-weight: 650;
+    }
+    .summary {
+      color: #667085;
+      font-size: 14px;
+    }
+    .sql-item {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .sql-meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: #667085;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+    .index {
+      color: #2563eb;
+      font-weight: 650;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      background: #101828;
+      color: #f9fafb;
+      border-radius: 6px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="header">
+      <h1>${escapeHtml(title)}</h1>
+      <div class="summary">共 ${sqlList.length} 条可读 SQL</div>
+    </header>
+    ${rows}
+  </main>
+</body>
+</html>`
+
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const detailWindow = window.open(url, '_blank', 'noopener,noreferrer')
+  if (!detailWindow) {
+    URL.revokeObjectURL(url)
+    return
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 30000)
+}
+
 function saveFeedback() {
   store.saveFeedback({
     helpful: feedbackForm.helpful,
@@ -415,45 +532,18 @@ function saveFeedback() {
   font-size: 18px;
 }
 
+.signal-title-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
 .signal-item p {
   margin-top: 8px;
   color: #667085;
   line-height: 1.5;
   word-break: break-word;
-}
-
-.sql-list {
-  margin-top: 14px;
-}
-
-.sql-list h4 {
-  font-size: 14px;
-  margin-bottom: 10px;
-}
-
-.sql-item {
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  padding: 12px;
-  background: #fcfcfd;
-  margin-bottom: 10px;
-}
-
-.sql-meta {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  color: #667085;
-  margin-bottom: 8px;
-}
-
-.sql-item pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #344054;
 }
 
 .cause-block {

@@ -7,6 +7,7 @@ Java 代码调用链静态分析器
 
 import os
 import re
+import glob
 import json
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
@@ -67,9 +68,14 @@ class JavaCallChainAnalyzer:
             url = get_git_repo_url(repo_key)
             if not url:
                 raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
-            self.repo_path = None
-            self._git_fetcher = get_git_fetcher(url, ref)
-            self._use_remote = True
+            local_repo_path = self._resolve_local_repo_path(url)
+            if local_repo_path:
+                self.repo_path = local_repo_path
+                self._use_remote = False
+            else:
+                self.repo_path = None
+                self._git_fetcher = get_git_fetcher(url, ref)
+                self._use_remote = True
         elif repo_url:
             self.repo_path = None
             self._git_fetcher = get_git_fetcher(repo_url, ref)
@@ -85,8 +91,21 @@ class JavaCallChainAnalyzer:
         self._service_impl_cache: Dict[str, str] = {}
         self._mapper_sql_cache: Dict[str, Dict[str, str]] = {}
 
+    @staticmethod
+    def _resolve_local_repo_path(repo_url: str) -> Optional[str]:
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        direct_path = os.path.join('./repos', repo_name)
+        if os.path.isdir(direct_path):
+            return direct_path
+
+        existing_clones = sorted(glob.glob(os.path.join('./repos', f"{repo_name}-*")))
+        for clone_path in existing_clones:
+            if os.path.isdir(clone_path):
+                return clone_path
+        return None
+
     def analyze(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
-        api_path = api_path.strip()
+        api_path = self._normalize_api_path(api_path)
         if api_path.endswith('.json'):
             api_path = api_path[:-5]
         if api_path.endswith('/'):
@@ -118,6 +137,14 @@ class JavaCallChainAnalyzer:
             result['trace_data'] = trace_data
 
         return result
+
+    @staticmethod
+    def _normalize_api_path(api_path: str) -> str:
+        try:
+            from scripts.fetch_trace_souche import TraceFetcher
+            return TraceFetcher.normalize_api_path(api_path) or (api_path or '').strip()
+        except Exception:
+            return (api_path or '').strip()
 
     def _read_file(self, file_path: str) -> Optional[str]:
         """读取文件内容，兼容本地和远程模式"""
@@ -262,7 +289,10 @@ class JavaCallChainAnalyzer:
         search_start = annotation_pos
         search_end = min(annotation_pos + 500, len(content))
         snippet = content[search_start:search_end]
-        method_match = re.search(r'public\s+\w+(?:<[^>]+>)?\s+(\w+)\s*\(', snippet)
+        method_match = re.search(
+            r'public\s+(?:<[^>]+>\s*)?[\w<>\[\],\s.?]+\s+(\w+)\s*\(',
+            snippet
+        )
         return method_match.group(1) if method_match else "unknown"
 
     def _build_call_chain(self, class_name: str, method_name: str, file_path: str, line_number: int) -> CallChainNode:

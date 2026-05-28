@@ -12,7 +12,7 @@ import os
 import sys
 from datetime import datetime
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import re
 
 import urllib.request
@@ -37,9 +37,11 @@ class TraceFetcher:
             verify_ssl: Whether to verify SSL certificates
         """
         self.endpoint = endpoint
-        self.cookies = cookies
+        self.cookies = cookies or os.getenv("TRACE_COOKIES") or os.getenv("SOUCHE_TRACE_COOKIES")
+        self.cookie_diagnostics = self._inspect_cookies(self.cookies)
         self.verify_ssl = verify_ssl
         self.last_error = None
+        self.last_response_preview = None
 
     def fetch_trace(self, trace_id: str, date: str) -> dict:
         """Fetch trace tree from Souche trace system.
@@ -77,7 +79,7 @@ class TraceFetcher:
         headers = {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://trace.souche-inc.com/logTraceidResult.html",
+            "Referer": f"{self.endpoint}/logTraceidResult.html",
             "Sec-Ch-Ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"macOS"',
@@ -90,20 +92,25 @@ class TraceFetcher:
 
         req = urllib.request.Request(url, headers=headers)
         self.last_error = None
+        self.last_response_preview = None
 
         if self.cookies:
             req.add_header("Cookie", self.cookies)
 
         try:
+            response_headers = {}
             if self.verify_ssl:
                 with urllib.request.urlopen(req) as response:
+                    response_headers = dict(response.headers)
                     content = response.read().decode('utf-8')
             else:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 with urllib.request.urlopen(req, context=ctx) as response:
+                    response_headers = dict(response.headers)
                     content = response.read().decode('utf-8')
+            self.last_response_preview = self._build_response_preview(content, response_headers)
 
             if not content or content.strip() == '':
                 self.last_error = {
@@ -140,12 +147,79 @@ class TraceFetcher:
             print(f"URL Error: {e.reason}", file=sys.stderr)
             return None
         except json.JSONDecodeError as e:
+            preview = self.last_response_preview or {}
+            detail = preview.get("hint") or preview.get("content_type") or ""
+            message = "链路平台返回内容不是有效数据"
+            if detail:
+                message = f"{message}（{detail}）"
+            cookie_hint = self.cookie_diagnostics.get("hint")
+            if cookie_hint:
+                message = f"{message}。{cookie_hint}"
             self.last_error = {
                 "type": "invalid_response",
-                "message": "链路平台返回内容不是有效数据"
+                "message": message,
+                "response_preview": preview
             }
             print(f"JSON Decode Error: {e}", file=sys.stderr)
             return None
+
+    @staticmethod
+    def _inspect_cookies(cookies: Optional[str]) -> dict:
+        if not cookies:
+            return {
+                "has_cookie": False,
+                "hint": "当前请求未携带链路平台 Cookie"
+            }
+
+        invalid_names = []
+        names = set()
+        for part in cookies.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not name:
+                continue
+            names.add(name)
+            if value.lower() in {"undefined", "null", ""}:
+                invalid_names.append(name)
+
+        hints = []
+        if invalid_names:
+            hints.append(f"Cookie 字段 {', '.join(invalid_names)} 的值无效")
+        if "JSESSIONID" not in names:
+            hints.append("Cookie 缺少 JSESSIONID")
+        if "_security_token_inc" not in names:
+            hints.append("Cookie 缺少 _security_token_inc")
+        if "_user_iid" not in names:
+            hints.append("Cookie 缺少 _user_iid")
+
+        return {
+            "has_cookie": True,
+            "invalid_names": invalid_names,
+            "names": sorted(names),
+            "hint": "；".join(hints)
+        }
+
+    @staticmethod
+    def _build_response_preview(content: str, headers: dict) -> dict:
+        content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+        stripped = (content or "").strip()
+        preview = re.sub(r'\s+', ' ', stripped)[:240]
+        hint = ""
+        lower_preview = preview.lower()
+        if "<html" in lower_preview or "<!doctype html" in lower_preview:
+            hint = "返回的是 HTML 页面，通常是登录失效、无权限或网关错误；请重新登录链路平台后复制 Cookie，或在服务端配置 TRACE_COOKIES"
+        elif stripped.startswith("__") and "(" in stripped[:80]:
+            hint = "返回的是 JSONP，不是 JSON"
+        elif stripped and not stripped.startswith(("{", "[")):
+            hint = "返回内容不是 JSON"
+        return {
+            "content_type": content_type,
+            "preview": preview,
+            "hint": hint
+        }
 
     @staticmethod
     def _extract_params_from_sql(actual_sql: str, sql_template: str) -> list:
@@ -261,11 +335,15 @@ class TraceFetcher:
             if data.get("type") == "http-server":
                 path = data.get("path", "")
                 if path:
-                    api_paths.add(path)
+                    normalized_path = TraceFetcher.normalize_api_path(path)
+                    if normalized_path:
+                        api_paths.add(normalized_path)
             # Also check 'path' field directly (some APIs use this)
             path = data.get("path", "")
             if path and isinstance(path, str) and path.startswith('/'):
-                api_paths.add(path)
+                normalized_path = TraceFetcher.normalize_api_path(path)
+                if normalized_path:
+                    api_paths.add(normalized_path)
 
             for key, value in data.items():
                 if key != 'data' and isinstance(value, (dict, list)):
@@ -275,6 +353,42 @@ class TraceFetcher:
                 api_paths.update(TraceFetcher.extract_api_paths(item))
 
         return list(api_paths)
+
+    @staticmethod
+    def normalize_api_path(path: str) -> Optional[str]:
+        if not path or not isinstance(path, str):
+            return None
+
+        text = path.strip()
+        if not text:
+            return None
+
+        if text.startswith(("http://", "https://")):
+            text = urlparse(text).path or ""
+
+        text = text.split("?", 1)[0].split("#", 1)[0].strip()
+        if not text.startswith("/"):
+            text = f"/{text}"
+
+        # Some trace nodes concatenate a display/class path with the real URL:
+        # /v1/FooAction//v1/crm/foo/bar -> /v1/crm/foo/bar
+        if "//" in text:
+            parts = [part.strip("/") for part in re.split(r"/{2,}", text) if part.strip("/")]
+            preferred = None
+            for part in reversed(parts):
+                if re.match(r"(?:v\d+|crm|ai|admin|api)/", part, re.IGNORECASE):
+                    preferred = part
+                    break
+            text = f"/{preferred or parts[-1]}" if parts else text
+
+        text = re.sub(r"/+", "/", text)
+        if text.endswith("/") and len(text) > 1:
+            text = text[:-1]
+
+        if text.endswith(".json"):
+            text = text[:-5]
+
+        return text if text != "/" else None
 
     @staticmethod
     def format_complete_sql(detail: dict) -> Optional[str]:
@@ -758,7 +872,7 @@ class TraceFetcher:
         headers = {
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://trace.souche-inc.com/index.html",
+            "Referer": f"{self.endpoint}/index.html",
             "Sec-Ch-Ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"macOS"',
@@ -819,7 +933,7 @@ class TraceFetcher:
 # Environment endpoints
 ENV_ENDPOINTS = {
     "pro": "https://trace.souche-inc.com",
-    "env": "https://test-trace.dasouche-inc.net"
+    "env": "http://test-trace.dasouche-inc.net"
 }
 DEFAULT_ENV = "pro"  # Default environment: pro or env
 

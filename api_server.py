@@ -182,7 +182,12 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             trace_id=req.trace_id,
             trace_date=req.trace_date,
             cookies=req.cookies,
-            use_ai=req.use_ai
+            use_ai=req.use_ai,
+            environment=req.environment,
+            time_window=req.time_window,
+            problem_type=req.problem_type,
+            services=req.services,
+            extra_clues=req.extra_clues
         )
         result["request_context"] = {
             "environment": req.environment,
