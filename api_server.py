@@ -41,7 +41,7 @@ app.add_middleware(
 
 class AnalyzeRequest(BaseModel):
     """分析请求模型"""
-    api_path: str               # 如 "/v1/customerAction/saveOrUpdateCustomer"
+    api_path: Optional[str] = None  # 如 "/v1/customerAction/saveOrUpdateCustomer"，可由 Trace ID 自动识别
     repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
     repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
     ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
@@ -128,13 +128,29 @@ async def analyze_api(req: AnalyzeRequest):
                 status_code=400,
                 detail="repo_key or repo_url is required"
             )
-        result = analyzer.analyze(
-            req.api_path,
+        api_path = (req.api_path or '').strip()
+        if api_path:
+            result = analyzer.analyze(
+                api_path,
+                req.trace_id,
+                req.date,
+                req.cookies
+            )
+            return result
+
+        if not req.trace_id:
+            raise HTTPException(
+                status_code=400,
+                detail="未提供 API 路径，且无 Trace ID 可用于自动识别"
+            )
+
+        return analyzer.analyze_from_trace(
             req.trace_id,
             req.date,
             req.cookies
         )
-        return result
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
@@ -195,7 +211,10 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             "problem_type": req.problem_type,
             "services": req.services or [],
             "extra_clues": req.extra_clues,
-            "trace_id": req.trace_id,
+            "trace_id": result.get("trace_id") or req.trace_id,
+            "trace_id_source": result.get("trace_id_source", "manual" if req.trace_id else "none"),
+            "trace_id_candidates": result.get("trace_id_candidates", []),
+            "trace_id_note": result.get("trace_id_note"),
             "trace_date": req.trace_date
         }
         return result

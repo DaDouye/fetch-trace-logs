@@ -9,6 +9,7 @@ import os
 import re
 import glob
 import json
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path
@@ -755,6 +756,81 @@ class JavaCallChainAnalyzer:
         if match:
             return {'name': method_name, 'line': content[:match.start()].count('\n') + 1}
         return None
+
+    def analyze_from_trace(self, trace_id: str, date: str = None, cookies: str = None) -> Dict[str, Any]:
+        trace_data = self._fetch_raw_trace_data(trace_id, date, cookies)
+        warnings = []
+        result = {
+            'api_path': None,
+            'source': 'trace',
+            'trace_data': trace_data,
+            'detected_api_paths': [],
+            'call_chains': [],
+            'warnings': warnings
+        }
+
+        if not trace_data:
+            warnings.append('未获取到 Trace 数据，无法自动识别入口 API')
+            return result
+
+        if trace_data.get('error'):
+            warnings.append(trace_data['error'])
+            return result
+
+        api_paths = self._extract_api_paths_from_trace(trace_data)
+        result['detected_api_paths'] = api_paths
+        if not api_paths:
+            warnings.append('已获取 Trace，但未能识别入口 API')
+            return result
+
+        for api_path in api_paths:
+            result['call_chains'].append({
+                'api_path': api_path,
+                'call_chain': self.analyze(api_path)
+            })
+
+        return result
+
+    @staticmethod
+    def _extract_api_paths_from_trace(trace_data: Dict[str, Any]) -> List[str]:
+        try:
+            from scripts.fetch_trace_souche import TraceFetcher
+            raw_paths = TraceFetcher.extract_api_paths(trace_data)
+        except Exception:
+            raw_paths = trace_data.get('api_paths', []) if isinstance(trace_data, dict) else []
+
+        api_paths = []
+        seen = set()
+        for path in raw_paths or []:
+            normalized = JavaCallChainAnalyzer._normalize_api_path(path)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            api_paths.append(normalized)
+        return api_paths
+
+    def _fetch_raw_trace_data(self, trace_id: str, date: str = None, cookies: str = None) -> Optional[Dict]:
+        try:
+            from scripts.fetch_trace_souche import TraceFetcher
+            effective_date = date or self._infer_trace_date(trace_id)
+            if not effective_date:
+                return {'error': '未提供 Trace 日期，且无法从 Trace ID 推断日期。请填写 Trace 日期（YYYY-MM-DD）。'}
+            verify_ssl = os.getenv("TRACE_VERIFY_SSL", "false").lower() == "true"
+            fetcher = TraceFetcher(cookies=cookies, verify_ssl=verify_ssl)
+            return fetcher.fetch_trace(trace_id, effective_date)
+        except Exception as e:
+            return {'error': str(e)}
+
+    @staticmethod
+    def _infer_trace_date(trace_id: str) -> Optional[str]:
+        match = re.match(r'^(\d{13})_', trace_id or '')
+        if not match:
+            return None
+        try:
+            ts = int(match.group(1)) / 1000
+            return datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+        except Exception:
+            return None
 
     def _fetch_trace_data(self, trace_id: str, date: str, cookies: str = None) -> Optional[Dict]:
         """获取运行时 Trace 数据"""

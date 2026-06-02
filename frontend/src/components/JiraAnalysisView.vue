@@ -31,7 +31,8 @@
                 <span v-else>未填写</span>
               </n-descriptions-item>
               <n-descriptions-item label="Trace">
-                {{ displayTraceId }}
+                <div>{{ displayTraceId }}</div>
+                <div v-if="traceIdHint" class="muted-text">{{ traceIdHint }}</div>
               </n-descriptions-item>
             </n-descriptions>
           </section>
@@ -242,6 +243,13 @@ const traceSqlList = computed(() => traceSummary.value?.sql || [])
 const displayTraceId = computed(() =>
   traceSummary.value?.trace_id || requestContext.value.trace_id || '未提供'
 )
+
+const traceIdHint = computed(() => {
+  const source = requestContext.value.trace_id_source
+  if (source === 'manual') return '用户填写'
+  if (source === 'jira') return requestContext.value.trace_id_note || '从 Jira 自动识别'
+  return ''
+})
 
 const evidenceCount = computed(() => {
   const files = jiraResult.value?.code_context?.files?.length || 0

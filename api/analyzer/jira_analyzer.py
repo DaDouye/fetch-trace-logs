@@ -345,10 +345,19 @@ class JiraAnalyzer:
 
         # 1. Fetch JIRA content
         result['jira'] = self._fetch_jira_content(issue_key)
+        trace_resolution = self._resolve_trace_id(trace_id, result['jira'])
+        result['trace_id'] = trace_resolution['trace_id']
+        result['trace_id_source'] = trace_resolution['source']
+        result['trace_id_candidates'] = trace_resolution['candidates']
+        result['trace_id_note'] = trace_resolution['note']
 
         # 2. Build code context
         result['code_context'] = self._build_code_context(
+<<<<<<< HEAD
             issue_key, api_paths, trace_id, trace_date, cookies, explicit_code_context
+=======
+            issue_key, api_paths, trace_resolution['trace_id'], trace_date, cookies
+>>>>>>> d8d9c4c9a34affcf688366274d3123c8db924a39
         )
 
         # 3. Perform cause analysis
@@ -372,6 +381,16 @@ class JiraAnalyzer:
             for a in attachments
         ]
 
+        comments = self.jira_client.get_comments(issue_key)
+        comment_list = [
+            {
+                'author': c.get('author', {}).get('displayName', 'Unknown'),
+                'body': c.get('body', ''),
+                'created': c.get('created', '')
+            }
+            for c in comments
+        ]
+
         # Extract keywords for code search
         issue_full = self.jira_client.get_issue(issue_key)
         keywords = self.jira_client.extract_keywords(issue_full)
@@ -392,8 +411,61 @@ class JiraAnalyzer:
             'customfield_19900': summary.get('customfield_19900', ''),
             'attachment': summary.get('attachment', []),
             'attachments': attachment_list,
+            'comments': comment_list,
             'keywords': keywords
         }
+
+    def _resolve_trace_id(self, request_trace_id: Optional[str], jira: Dict[str, Any]) -> Dict[str, Any]:
+        manual_trace_id = (request_trace_id or '').strip()
+        candidates = self._extract_trace_id_candidates_from_jira(jira)
+        if manual_trace_id:
+            return {
+                'trace_id': manual_trace_id,
+                'source': 'manual',
+                'candidates': candidates,
+                'note': '使用用户手动填写的 Trace ID'
+            }
+        if candidates:
+            note = '从 Jira 文本自动识别到 Trace ID'
+            if len(candidates) > 1:
+                note = f'从 Jira 文本识别到 {len(candidates)} 个 Trace ID，默认使用第一个'
+            return {
+                'trace_id': candidates[0],
+                'source': 'jira',
+                'candidates': candidates,
+                'note': note
+            }
+        return {
+            'trace_id': None,
+            'source': 'none',
+            'candidates': [],
+            'note': '未从 Jira 文本识别到 Trace ID'
+        }
+
+    def _extract_trace_id_candidates_from_jira(self, jira: Dict[str, Any]) -> List[str]:
+        text_parts = [
+            str(jira.get('summary') or ''),
+            str(jira.get('description') or ''),
+            str(jira.get('customfield_19900') or '')
+        ]
+        for comment in jira.get('comments') or []:
+            text_parts.append(str(comment.get('body') or ''))
+        text = '\n'.join(text_parts)
+
+        tagged_pattern = re.compile(
+            r'(?:trace\s*[-_ ]?id|traceid|链路\s*id|链路ID)\s*[:：=]\s*([0-9]{13}_[A-Za-z0-9]+)',
+            re.IGNORECASE
+        )
+        matches = tagged_pattern.findall(text)
+
+        candidates = []
+        seen = set()
+        for trace_id in matches:
+            if trace_id in seen:
+                continue
+            seen.add(trace_id)
+            candidates.append(trace_id)
+        return candidates
 
     def _build_code_context(
         self,

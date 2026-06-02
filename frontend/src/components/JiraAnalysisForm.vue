@@ -97,7 +97,7 @@
         <n-gi span="1">
           <n-form-item label="Trace ID (可选)" path="traceId">
             <n-space align="end">
-              <n-input v-model:value="formValue.traceId" placeholder="Trace ID" style="flex: 1" />
+              <n-input v-model:value="formValue.traceId" placeholder="可留空，系统会尝试从 Jira 识别" style="flex: 1" />
               <n-button
                 size="small"
                 tag="a"
