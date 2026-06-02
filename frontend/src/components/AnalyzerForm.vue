@@ -13,10 +13,10 @@
           </n-form-item>
         </n-gi>
         <n-gi span="2">
-          <n-form-item label="API 路径" path="apiPath">
+          <n-form-item label="API 路径（可选）" path="apiPath">
             <n-input
               v-model:value="formValue.apiPath"
-              placeholder="如: /v1/customer/saveOrUpdate"
+              placeholder="可填 API 路径，或填写 Trace ID 自动识别"
               @keydown.enter="handleAnalyze"
             />
           </n-form-item>
@@ -81,8 +81,7 @@ const formValue = ref({
 })
 
 const rules = {
-  repoKey: { required: true, message: '请选择仓库', trigger: 'change' },
-  apiPath: { required: true, message: '请输入 API 路径', trigger: 'input' }
+  repoKey: { required: true, message: '请选择仓库', trigger: 'change' }
 }
 
 const repoOptions = computed(() =>
@@ -101,9 +100,11 @@ function handleAnalyze() {
     if (errors) return
 
     const params = {
-      api_path: formValue.value.apiPath.trim(),
       repo_key: formValue.value.repoKey
     }
+
+    const apiPath = formValue.value.apiPath.trim()
+    if (apiPath) params.api_path = apiPath
 
     if (formValue.value.traceId) params.trace_id = formValue.value.traceId
     if (formValue.value.date) {
