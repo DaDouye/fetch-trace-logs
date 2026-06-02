@@ -18,7 +18,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from api.jira_client import JiraClient
 from api.analyzer.rule_engine import RuleEngine
 from api.analyzer.code_search import CodeSearch
-from api.analyzer.ai_analyzer import AIAnalyzer
+from api.analyzer.claude_code_service import ClaudeCodeAnalysisService
 from api.analyzer.lightrag_indexer import LightRAGIndexer
 
 
@@ -55,7 +55,9 @@ class JiraAnalyzer:
         elif repo_url:
             self.repo_path = self._clone_or_get_local_repo(repo_url, ref) if self._is_repo_url(repo_url) else None
         elif repo_key:
-            self.repo_path = self._resolve_repo_path(repo_key)
+            repo_url_for_key = self._repo_url_from_key(repo_key)
+            self.repo_url = repo_url_for_key
+            self.repo_path = self._clone_or_get_local_repo(repo_url_for_key, ref) if repo_url_for_key else None
         else:
             self.repo_path = None
 
@@ -82,20 +84,28 @@ class JiraAnalyzer:
         self.rule_engine = RuleEngine()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
         # For multi-repo mode, we don't use single code_search but search each repo separately
-        self._ai_analyzer = None
+        self._claude_services: Dict[str, ClaudeCodeAnalysisService] = {}
         self._rag_indexer = None
 
-    @property
-    def ai_analyzer(self) -> AIAnalyzer:
-        if self._ai_analyzer is None:
-            self._ai_analyzer = AIAnalyzer()
-        return self._ai_analyzer
+    def _get_claude_service(self, repo_path: Optional[str] = None) -> ClaudeCodeAnalysisService:
+        target_path = repo_path or self.repo_path
+        if not target_path:
+            raise ValueError("缺少本地仓库路径，无法执行 Claude Code CLI 代码分析")
+        if target_path not in self._claude_services:
+            self._claude_services[target_path] = ClaudeCodeAnalysisService(target_path)
+        return self._claude_services[target_path]
 
     @property
     def rag_indexer(self) -> LightRAGIndexer:
         if self._rag_indexer is None:
             self._rag_indexer = LightRAGIndexer()
         return self._rag_indexer
+
+    def _repo_url_from_key(self, repo_key: str = None) -> Optional[str]:
+        if not repo_key:
+            return None
+        from config_manager import get_git_repo_url
+        return get_git_repo_url(repo_key)
 
     def _resolve_repo_path(self, repo_key: str = None) -> Optional[str]:
         """Resolve repository path from key or return None"""
@@ -200,14 +210,14 @@ class JiraAnalyzer:
         if len(matched) == 1:
             repo = matched[0]
             self.repo_key = repo['key']
-            self.repo_path = self._resolve_repo_path(repo['key'])
+            self.repo_path = self._clone_or_get_local_repo(repo['url'], 'master')
             self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
             print(f"[JiraAnalyzer] Auto-selected repo {repo['key']} for services: {services}")
             return
 
         self.multi_repo_paths = []
         for repo in matched:
-            local_path = self._resolve_repo_path(repo['key'])
+            local_path = self._clone_or_get_local_repo(repo['url'], 'master')
             self.multi_repo_paths.append({
                 'repo_url': repo['url'],
                 'ref': 'master',
@@ -493,28 +503,7 @@ class JiraAnalyzer:
         context['search_keywords'] = keywords
         print(f"[CodeContext] Keywords: {keywords}")
 
-        # 使用 JIRA 中的 api_paths 进行代码搜索
-        search_api_paths = keywords.get('api_paths', [])
-        if not search_api_paths:
-            search_api_paths = []
-        searched_keywords = {
-            'api_paths': set(search_api_paths),
-            'class_names': set(keywords.get('class_names', [])),
-            'error_patterns': set(keywords.get('error_patterns', [])),
-            'business_terms': set(keywords.get('business_terms', []))
-        }
-
-        if has_repo_context:
-            context['files'] = self._search_code(
-                api_paths=search_api_paths,
-                class_names=keywords.get('class_names', []),
-                error_patterns=keywords.get('error_patterns', []),
-                business_terms=keywords.get('business_terms', []),
-                source='jira'
-            )
-            print(f"[CodeContext] Search results: {len(context['files'])} files")
-        else:
-            print("[CodeContext] Skipping code search because no repository was provided")
+        search_api_paths = keywords.get('api_paths', []) or []
 
         # Fetch trace data if trace ID provided
         trace_api_paths = []
@@ -528,23 +517,6 @@ class JiraAnalyzer:
                 try:
                     trace_api_paths = self._normalize_api_paths(trace_data.get('api_paths', []))
                     print(f"[CodeContext] Extracted {len(trace_api_paths)} API paths from trace: {trace_api_paths}")
-                    trace_keywords = self._extract_trace_search_keywords(trace_data)
-                    if has_repo_context and (
-                        set(trace_api_paths) - searched_keywords['api_paths']
-                        or set(trace_keywords['error_patterns']) - searched_keywords['error_patterns']
-                        or set(trace_keywords['business_terms']) - searched_keywords['business_terms']
-                    ):
-                        trace_search_results = self._search_code(
-                            api_paths=trace_api_paths,
-                            error_patterns=trace_keywords['error_patterns'],
-                            business_terms=trace_keywords['business_terms'],
-                            source='trace'
-                        )
-                        context['files'] = self._merge_file_results(context['files'], trace_search_results)
-                        searched_keywords['api_paths'].update(trace_api_paths)
-                        searched_keywords['error_patterns'].update(trace_keywords['error_patterns'])
-                        searched_keywords['business_terms'].update(trace_keywords['business_terms'])
-                        print(f"[CodeContext] Search results after trace evidence: {len(context['files'])} files")
                 except Exception as e:
                     print(f"[CodeContext] Failed to extract API paths from trace: {e}")
 
@@ -562,53 +534,100 @@ class JiraAnalyzer:
             context['logs'] = log_data
             print(f"[CodeContext] Log data: fetched {len(log_data.get('entries', []))} entries")
 
-        # Perform call chain analysis for each API path
-        # 优先使用用户提供的api_paths，其次是trace提取的
-        call_chain_paths = self._normalize_api_paths(api_paths if api_paths else trace_api_paths)
-        print(f"[CodeContext] Call chain paths: {call_chain_paths}")
-        if call_chain_paths:
-            for api_path in call_chain_paths:
-                call_chain_result = self._analyze_call_chain(api_path)
-                if call_chain_result:
-                    context['call_chains'].append({
-                        'api_path': api_path,
-                        'call_chain': call_chain_result
-                    })
-            print(f"[CodeContext] Call chains: {len(context['call_chains'])}")
+        code_context_paths = self._normalize_api_paths(api_paths or search_api_paths or trace_api_paths)
+        print(f"[CodeContext] Claude Code CLI paths: {code_context_paths}")
+        if has_repo_context:
+            cli_context = self._build_code_context_with_claude(
+                jira=self.jira_client.get_issue(issue_key),
+                api_paths=code_context_paths,
+                trace_data=context.get('trace_data'),
+                logs=log_data,
+                keywords=keywords,
+                user_context=user_context
+            )
+            context['files'] = cli_context.get('files', [])
+            context['call_chains'] = cli_context.get('call_chains', [])
+            context['claude_code'] = {
+                'summary': cli_context.get('summary', ''),
+                'warnings': cli_context.get('warnings', []),
+                'metadata': cli_context.get('metadata', {})
+            }
+            print(f"[CodeContext] Claude Code CLI files={len(context['files'])}, call_chains={len(context['call_chains'])}")
+        else:
+            print("[CodeContext] No repository context, Claude Code CLI code analysis will be skipped")
 
         return context
 
+    def _build_code_context_with_claude(
+        self,
+        jira: Dict[str, Any],
+        api_paths: List[str],
+        trace_data: Optional[Dict[str, Any]],
+        logs: Optional[Dict[str, Any]],
+        keywords: Dict[str, Any],
+        user_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.multi_repo_paths:
+            files = []
+            call_chains = []
+            summaries = []
+            warnings = []
+            metadata = {'analysis_engine': 'claude_code_cli', 'repos': []}
+            for repo_info in self.multi_repo_paths:
+                local_path = repo_info.get('local_path')
+                service = self._get_claude_service(local_path)
+                result = service.build_jira_code_context(
+                    jira=jira,
+                    api_paths=api_paths,
+                    trace_context=trace_data,
+                    logs=logs,
+                    search_keywords=keywords,
+                    user_context=user_context,
+                    ref=repo_info.get('ref', 'master')
+                )
+                repo_url = repo_info.get('repo_url')
+                for item in result.get('files', []):
+                    item.setdefault('repo_url', repo_url)
+                    files.append(item)
+                for item in result.get('call_chains', []):
+                    item.setdefault('repo_url', repo_url)
+                    call_chains.append(item)
+                if result.get('summary'):
+                    summaries.append(result['summary'])
+                warnings.extend(result.get('warnings', []))
+                metadata['repos'].append({
+                    'repo_url': repo_url,
+                    'ref': repo_info.get('ref', 'master'),
+                    'metadata': result.get('metadata', {})
+                })
+            return {
+                'files': files,
+                'call_chains': call_chains,
+                'summary': '\n'.join(summaries),
+                'warnings': warnings,
+                'metadata': metadata
+            }
+
+        service = self._get_claude_service()
+        return service.build_jira_code_context(
+            jira=jira,
+            api_paths=api_paths,
+            trace_context=trace_data,
+            logs=logs,
+            search_keywords=keywords,
+            user_context=user_context,
+            ref=self.ref
+        )
+
     def _analyze_call_chain(self, api_path: str) -> Optional[Dict[str, Any]]:
-        """Perform call chain analysis using existing analyzer"""
-        if not self.repo_path and not self.repo_key and not self.repo_url and not self.multi_repo_paths:
-            print(f"[CallChain] No repo_path, repo_key, repo_url or repo_urls, skipping call chain analysis for {api_path}")
-            return None
-
-        try:
-            from api.analyze import JavaCallChainAnalyzer
-            print(f"[CallChain] Analyzing call chain for: {api_path}")
-
-            # Multi-repo mode: analyze first repo (call chain analysis is typically repo-specific)
-            if self.multi_repo_paths:
-                repo_info = self.multi_repo_paths[0]
-                if repo_info.get('local_path') and os.path.exists(repo_info.get('local_path')):
-                    analyzer = JavaCallChainAnalyzer(repo_path=repo_info.get('local_path'))
-                else:
-                    analyzer = JavaCallChainAnalyzer(repo_url=repo_info.get('repo_url'), ref=repo_info.get('ref', 'master'))
-            elif self.repo_url:
-                analyzer = JavaCallChainAnalyzer(repo_url=self.repo_url, ref=self.ref)
-            elif self.repo_path and os.path.exists(self.repo_path):
-                analyzer = JavaCallChainAnalyzer(repo_path=self.repo_path)
-            else:
-                analyzer = JavaCallChainAnalyzer(repo_key=self.repo_key)
-            result = analyzer.analyze(api_path)
-            print(f"[CallChain] Result: {result.get('error', 'success')}")
-            return result
-        except Exception as e:
-            print(f"[CallChain] Error: {e}")
-            import traceback
-            print(f"[CallChain] Traceback: {traceback.format_exc()}")
-            return {'error': str(e)}
+        """Perform call chain analysis using Claude Code CLI."""
+        if self.multi_repo_paths:
+            repo_info = self.multi_repo_paths[0]
+            return self._get_claude_service(repo_info.get('local_path')).analyze_call_chain(
+                api_path=api_path,
+                ref=repo_info.get('ref', 'master')
+            )
+        return self._get_claude_service().analyze_call_chain(api_path=api_path, ref=self.ref)
 
     @staticmethod
     def _normalize_api_paths(api_paths: Optional[List[str]]) -> List[str]:
@@ -1194,48 +1213,34 @@ class JiraAnalyzer:
         if code_trace_causes:
             causes = code_trace_causes + causes
 
-        # AI-enhanced analysis
+        # Claude Code CLI-enhanced analysis
         ai_enhanced = False
         rag_context = None
         if use_ai:
-            try:
-                if os.getenv("RAG_CONTEXT_ENABLED", "false").lower() == "true":
-                    rag_context = self.rag_indexer.get_context_for_analysis(jira, code_context)
-                    print(f"[_analyze_causes] RAG context retrieved: {len(rag_context) if rag_context else 0} chars")
+            if os.getenv("RAG_CONTEXT_ENABLED", "false").lower() == "true":
+                rag_context = self.rag_indexer.get_context_for_analysis(jira, code_context)
+                print(f"[_analyze_causes] RAG context retrieved: {len(rag_context) if rag_context else 0} chars")
 
-                ai_result = self.ai_analyzer.analyze(jira, code_context, trace_data, rag_context)
-                ai_causes = ai_result.get('possible_causes', [])
-
-                if ai_causes:
-                    causes.extend(ai_causes)
-                    ai_enhanced = True
-                else:
-                    # AI didn't return useful results, add a default analysis
-                    causes.append({
-                        'id': 'ai_analysis',
-                        'category': '问题分析',
-                        'analysis': f'根据JIRA问题「{jira.get("summary", "")}」的分析，'
-                                    f'问题可能涉及业务流程、状态管理或数据一致性问题。'
-                                    f'建议检查相关接口的入参、权限以及数据库状态。',
-                        'suggestion': '1. 检查接口调用参数是否完整\n2. 验证用户权限和状态\n3. 查看相关数据库记录\n4. 确认业务流程是否正确执行',
-                        'confidence': 0.7
-                    })
-                    ai_enhanced = True
-            except Exception as e:
-                # AI调用失败时添加默认分析
+            cli_result = self._analyze_causes_with_claude(
+                jira=jira,
+                code_context=code_context,
+                trace_data=trace_data,
+                rule_causes=causes,
+                rag_context=rag_context
+            )
+            cli_causes = cli_result.get('possible_causes', [])
+            if cli_causes:
+                causes.extend(cli_causes)
+            if cli_result.get('summary'):
                 causes.append({
-                    'id': 'ai_analysis_error',
-                    'category': '问题分析',
-                    'analysis': f'系统分析完成，根据问题描述「{jira.get("summary", "")}」，'
-                                f'该问题可能涉及以下方面：\n'
-                                f'1. 业务流程执行异常\n'
-                                f'2. 数据状态不一致\n'
-                                f'3. 接口调用失败或超时\n'
-                                f'4. 权限或认证问题\n\n'
-                                f'AI分析服务暂时不可用，请人工排查。',
-                    'suggestion': '1. 检查相关接口的日志\n2. 验证数据状态\n3. 确认业务流程是否正常',
-                    'confidence': 0.5
+                    'id': 'claude_code_summary',
+                    'category': 'Claude Code 综合结论',
+                    'analysis': cli_result['summary'],
+                    'suggestion': '优先按照 Claude Code CLI 关联到的代码位置、Trace 节点和日志证据排查。',
+                    'confidence': 0.8,
+                    'metadata': cli_result.get('metadata', {})
                 })
+            ai_enhanced = True
 
         if os.getenv("RAG_AUTO_INDEX", "false").lower() == "true":
             try:
@@ -1255,6 +1260,56 @@ class JiraAnalyzer:
             'possible_causes': causes,
             'ai_enhanced': ai_enhanced
         }
+
+    def _analyze_causes_with_claude(
+        self,
+        jira: Dict[str, Any],
+        code_context: Dict[str, Any],
+        trace_data: Optional[Dict[str, Any]],
+        rule_causes: List[Dict[str, Any]],
+        rag_context: Optional[str]
+    ) -> Dict[str, Any]:
+        user_context = getattr(self, 'user_context', {})
+        if self.multi_repo_paths:
+            possible_causes = []
+            summaries = []
+            metadata = {'analysis_engine': 'claude_code_cli', 'repos': []}
+            for repo_info in self.multi_repo_paths:
+                result = self._get_claude_service(repo_info.get('local_path')).analyze_jira_causes(
+                    jira=jira,
+                    code_context=code_context,
+                    trace_context=trace_data,
+                    rule_causes=rule_causes,
+                    user_context=user_context,
+                    rag_context=rag_context,
+                    ref=repo_info.get('ref', 'master')
+                )
+                repo_url = repo_info.get('repo_url')
+                for cause in result.get('possible_causes', []):
+                    cause.setdefault('repo_url', repo_url)
+                    possible_causes.append(cause)
+                if result.get('summary'):
+                    summaries.append(result['summary'])
+                metadata['repos'].append({
+                    'repo_url': repo_url,
+                    'ref': repo_info.get('ref', 'master'),
+                    'metadata': result.get('metadata', {})
+                })
+            return {
+                'possible_causes': possible_causes,
+                'summary': '\n'.join(summaries),
+                'metadata': metadata
+            }
+
+        return self._get_claude_service().analyze_jira_causes(
+            jira=jira,
+            code_context=code_context,
+            trace_context=trace_data,
+            rule_causes=rule_causes,
+            user_context=user_context,
+            rag_context=rag_context,
+            ref=self.ref
+        )
 
     def _combine_text_for_analysis(self, jira: Dict, code_context: Dict) -> str:
         """Combine all text sources for analysis"""

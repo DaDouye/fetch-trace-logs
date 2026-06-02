@@ -9,12 +9,14 @@ import os
 import re
 import glob
 import json
+import hashlib
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path
 
 from api.git_fetcher import get_git_fetcher, GitFetcher
+from api.analyzer.claude_code_service import ClaudeCodeAnalysisService
 
 
 @dataclass
@@ -60,6 +62,8 @@ class JavaCallChainAnalyzer:
         """
         self._git_fetcher: Optional[GitFetcher] = None
         self._use_remote = False
+        self.repo_url = repo_url
+        self.ref = ref
 
         if repo_path:
             self.repo_path = repo_path
@@ -69,24 +73,21 @@ class JavaCallChainAnalyzer:
             url = get_git_repo_url(repo_key)
             if not url:
                 raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
+            self.repo_url = url
             local_repo_path = self._resolve_local_repo_path(url)
-            if local_repo_path:
-                self.repo_path = local_repo_path
-                self._use_remote = False
-            else:
-                self.repo_path = None
-                self._git_fetcher = get_git_fetcher(url, ref)
-                self._use_remote = True
+            if not local_repo_path:
+                local_repo_path = self._clone_or_get_local_repo(url, ref)
+            self.repo_path = local_repo_path
+            self._use_remote = False
         elif repo_url:
-            self.repo_path = None
-            self._git_fetcher = get_git_fetcher(repo_url, ref)
-            self._use_remote = True
+            self.repo_path = self._clone_or_get_local_repo(repo_url, ref)
+            self._use_remote = False
         else:
             raise ValueError("必须提供 repo_path、repo_key 或 repo_url 参数")
 
-        if not self._use_remote:
-            self.web_src_path = os.path.join(self.repo_path, 'web/src/main/java')
-            self.config_path = os.path.join(self.repo_path, 'web/config')
+        self.web_src_path = os.path.join(self.repo_path, 'web/src/main/java')
+        self.config_path = os.path.join(self.repo_path, 'web/config')
+        self.claude_service = ClaudeCodeAnalysisService(self.repo_path)
 
         self._controller_cache: Dict[str, Tuple[str, str, int]] = {}
         self._service_impl_cache: Dict[str, str] = {}
@@ -105,6 +106,37 @@ class JavaCallChainAnalyzer:
                 return clone_path
         return None
 
+    @staticmethod
+    def _clone_or_get_local_repo(repo_url: str, ref: str = "master") -> str:
+        import git
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        safe_ref = re.sub(r'[^A-Za-z0-9_.-]+', '_', ref or 'master')
+        repo_hash = hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:8]
+        local_path = os.path.join('./repos', f"{repo_name}-{safe_ref}-{repo_hash}")
+
+        if os.path.exists(local_path):
+            repo = git.Repo(local_path)
+            try:
+                repo.remotes.origin.fetch(ref)
+                JavaCallChainAnalyzer._checkout_ref(repo, ref)
+            except Exception:
+                pass
+            return local_path
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        repo = git.Repo.clone_from(repo_url, local_path)
+        JavaCallChainAnalyzer._checkout_ref(repo, ref)
+        return local_path
+
+    @staticmethod
+    def _checkout_ref(repo, ref: str) -> None:
+        if not ref:
+            return
+        try:
+            repo.git.checkout(ref)
+        except Exception:
+            repo.git.checkout("FETCH_HEAD")
+
     def analyze(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
         api_path = self._normalize_api_path(api_path)
         if api_path.endswith('.json'):
@@ -112,31 +144,18 @@ class JavaCallChainAnalyzer:
         if api_path.endswith('/'):
             api_path = api_path[:-1]
 
-        controller_info = self._find_controller_method(api_path)
-        if not controller_info:
-            return {'error': f'找不到 API: {api_path}', 'api_path': api_path}
-
-        controller_class, controller_method, controller_file, controller_line = controller_info
-        call_chain = self._build_call_chain(controller_class, controller_method, controller_file, controller_line)
-
         trace_data = None
         if trace_id:
             trace_data = self._fetch_trace_data(trace_id, date, cookies)
 
-        ascii_graph = self._format_ascii(call_chain, api_path)
-
-        result = {
-            'api_path': api_path,
-            'method': 'POST',
-            'controller': controller_class,
-            'controller_method': controller_method,
-            'call_chain': self._serialize_call_chain(call_chain),
-            'ascii_graph': ascii_graph
-        }
-
+        result = self.claude_service.analyze_call_chain(
+            api_path=api_path,
+            trace_context=trace_data,
+            ref=self.ref
+        )
+        result['api_path'] = api_path
         if trace_data:
             result['trace_data'] = trace_data
-
         return result
 
     @staticmethod

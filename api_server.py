@@ -17,6 +17,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 load_dotenv()
 
 from api.analyze import JavaCallChainAnalyzer
+from api.analyzer.claude_code_service import ClaudeCodeAnalysisError
 from config_manager import get_all_git_repos
 
 app = FastAPI(
@@ -151,6 +152,12 @@ async def analyze_api(req: AnalyzeRequest):
         )
     except HTTPException:
         raise
+    except ClaudeCodeAnalysisError as e:
+        raise HTTPException(status_code=502, detail={
+            "message": str(e),
+            "analysis_engine": "claude_code_cli",
+            "details": e.details
+        })
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
@@ -218,6 +225,12 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             "trace_date": req.trace_date
         }
         return result
+    except ClaudeCodeAnalysisError as e:
+        raise HTTPException(status_code=502, detail={
+            "message": str(e),
+            "analysis_engine": "claude_code_cli",
+            "details": e.details
+        })
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
