@@ -195,7 +195,10 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             "problem_type": req.problem_type,
             "services": req.services or [],
             "extra_clues": req.extra_clues,
-            "trace_id": req.trace_id,
+            "trace_id": result.get("trace_id") or req.trace_id,
+            "trace_id_source": result.get("trace_id_source", "manual" if req.trace_id else "none"),
+            "trace_id_candidates": result.get("trace_id_candidates", []),
+            "trace_id_note": result.get("trace_id_note"),
             "trace_date": req.trace_date
         }
         return result
