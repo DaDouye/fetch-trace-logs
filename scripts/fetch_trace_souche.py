@@ -337,13 +337,19 @@ class TraceFetcher:
                 if path:
                     normalized_path = TraceFetcher.normalize_api_path(path)
                     if normalized_path:
-                        api_paths.add(normalized_path)
+                        if isinstance(normalized_path, list):
+                            api_paths.update(normalized_path)
+                        else:
+                            api_paths.add(normalized_path)
             # Also check 'path' field directly (some APIs use this)
             path = data.get("path", "")
             if path and isinstance(path, str) and path.startswith('/'):
                 normalized_path = TraceFetcher.normalize_api_path(path)
                 if normalized_path:
-                    api_paths.add(normalized_path)
+                    if isinstance(normalized_path, list):
+                        api_paths.update(normalized_path)
+                    else:
+                        api_paths.add(normalized_path)
 
             for key, value in data.items():
                 if key != 'data' and isinstance(value, (dict, list)):
@@ -371,15 +377,20 @@ class TraceFetcher:
             text = f"/{text}"
 
         # Some trace nodes concatenate a display/class path with the real URL:
-        # /v1/FooAction//v1/crm/foo/bar -> /v1/crm/foo/bar
+        # /v1/FooAction//v1/crm/foo/bar -> [/v1/crm/foo/bar, /customer/customerDetail/...]
         if "//" in text:
             parts = [part.strip("/") for part in re.split(r"/{2,}", text) if part.strip("/")]
-            preferred = None
-            for part in reversed(parts):
-                if re.match(r"(?:v\d+|crm|ai|admin|api)/", part, re.IGNORECASE):
-                    preferred = part
-                    break
-            text = f"/{preferred or parts[-1]}" if parts else text
+            result = []
+            for part in parts:
+                cleaned = f"/{part}"
+                cleaned = re.sub(r"/+", "/", cleaned)
+                if cleaned.endswith("/") and len(cleaned) > 1:
+                    cleaned = cleaned[:-1]
+                if cleaned.endswith(".json"):
+                    cleaned = cleaned[:-5]
+                if cleaned and cleaned != "/":
+                    result.append(cleaned)
+            return result if result else None
 
         text = re.sub(r"/+", "/", text)
         if text.endswith("/") and len(text) > 1:
@@ -388,7 +399,7 @@ class TraceFetcher:
         if text.endswith(".json"):
             text = text[:-5]
 
-        return text if text != "/" else None
+        return [text] if text != "/" else None
 
     @staticmethod
     def format_complete_sql(detail: dict) -> Optional[str]:

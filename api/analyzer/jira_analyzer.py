@@ -4,6 +4,7 @@ JIRA Problem Analyzer - Unified analysis orchestration
 """
 
 import os
+import json
 import hashlib
 import re
 import glob
@@ -316,7 +317,15 @@ class JiraAnalyzer:
             'services': services or [],
             'extra_clues': extra_clues
         }
-        self._ensure_repo_context_from_services(self.user_context['services'])
+        explicit_code_context = bool(
+            api_paths
+            or self.repo_key
+            or self.repo_url
+            or self.repo_urls
+            or self.user_context['services']
+        )
+        if explicit_code_context:
+            self._ensure_repo_context_from_services(self.user_context['services'])
         # Extract issue key from URL
         issue_key = self.jira_client.extract_issue_key(jira_url)
         if not issue_key:
@@ -339,7 +348,7 @@ class JiraAnalyzer:
 
         # 2. Build code context
         result['code_context'] = self._build_code_context(
-            issue_key, api_paths, trace_id, trace_date, cookies
+            issue_key, api_paths, trace_id, trace_date, cookies, explicit_code_context
         )
 
         # 3. Perform cause analysis
@@ -392,12 +401,14 @@ class JiraAnalyzer:
         api_paths: Optional[List[str]],
         trace_id: Optional[str],
         trace_date: Optional[str],
-        cookies: Optional[str]
+        cookies: Optional[str],
+        enable_code_context: bool = False
     ) -> Dict[str, Any]:
         """Build code context from various sources"""
         context = {
             'files': [],
             'call_chains': [],
+            'business_evidence': [],
             'search_keywords': [],
             'logs': []
         }
@@ -414,9 +425,12 @@ class JiraAnalyzer:
         print(f"[CodeContext] repo_key: {self.repo_key}")
         print(f"[CodeContext] api_paths: {api_paths}")
         print(f"[CodeContext] multi_repo_paths: {len(self.multi_repo_paths) if self.multi_repo_paths else 0} repos")
+        print(f"[CodeContext] enable_code_context: {enable_code_context}")
 
         has_repo_context = bool(self.repo_path or self.repo_url or self.multi_repo_paths)
-        if not has_repo_context:
+        if not enable_code_context:
+            print("[CodeContext] Skipping code search and call chain because code analysis was not requested")
+        elif not has_repo_context:
             print("[CodeContext] No repository context, code search will be skipped")
 
         # Get keywords from JIRA for search
@@ -436,7 +450,7 @@ class JiraAnalyzer:
             'business_terms': set(keywords.get('business_terms', []))
         }
 
-        if has_repo_context:
+        if enable_code_context and has_repo_context:
             context['files'] = self._search_code(
                 api_paths=search_api_paths,
                 class_names=keywords.get('class_names', []),
@@ -445,7 +459,7 @@ class JiraAnalyzer:
                 source='jira'
             )
             print(f"[CodeContext] Search results: {len(context['files'])} files")
-        else:
+        elif enable_code_context:
             print("[CodeContext] Skipping code search because no repository was provided")
 
         # Fetch trace data if trace ID provided
@@ -453,7 +467,7 @@ class JiraAnalyzer:
         if trace_id:
             trace_data = self._fetch_trace_data(trace_id, trace_date, cookies)
             context['trace_data'] = trace_data
-            print(f"[CodeContext] Trace data: {trace_data}")
+            print(f"[CodeContext] Trace summary: {self._format_trace_log_summary(trace_data)}")
 
             # Extract API paths from trace data if no api_paths provided
             if trace_data and not trace_data.get('error'):
@@ -461,7 +475,7 @@ class JiraAnalyzer:
                     trace_api_paths = self._normalize_api_paths(trace_data.get('api_paths', []))
                     print(f"[CodeContext] Extracted {len(trace_api_paths)} API paths from trace: {trace_api_paths}")
                     trace_keywords = self._extract_trace_search_keywords(trace_data)
-                    if has_repo_context and (
+                    if enable_code_context and has_repo_context and (
                         set(trace_api_paths) - searched_keywords['api_paths']
                         or set(trace_keywords['error_patterns']) - searched_keywords['error_patterns']
                         or set(trace_keywords['business_terms']) - searched_keywords['business_terms']
@@ -494,31 +508,53 @@ class JiraAnalyzer:
             context['logs'] = log_data
             print(f"[CodeContext] Log data: fetched {len(log_data.get('entries', []))} entries")
 
-        # Perform call chain analysis for each API path
+        # Perform call chain analysis for all paths at once
         # 优先使用用户提供的api_paths，其次是trace提取的
         call_chain_paths = self._normalize_api_paths(api_paths if api_paths else trace_api_paths)
         print(f"[CodeContext] Call chain paths: {call_chain_paths}")
-        if call_chain_paths:
-            for api_path in call_chain_paths:
-                call_chain_result = self._analyze_call_chain(api_path)
-                if call_chain_result:
-                    context['call_chains'].append({
-                        'api_path': api_path,
-                        'call_chain': call_chain_result
-                    })
+        if enable_code_context and call_chain_paths:
+            call_chain_result = self._analyze_call_chain(call_chain_paths)
+            if call_chain_result:
+                context['call_chains'].append({
+                    'api_path': call_chain_paths,  # all paths
+                    'call_chain': call_chain_result
+                })
             print(f"[CodeContext] Call chains: {len(context['call_chains'])}")
+
+        if enable_code_context:
+            context['business_evidence'] = self._extract_business_evidence(context)
+            print(f"[CodeContext] Business evidence: {len(context['business_evidence'])}")
 
         return context
 
-    def _analyze_call_chain(self, api_path: str) -> Optional[Dict[str, Any]]:
-        """Perform call chain analysis using existing analyzer"""
+    @staticmethod
+    def _format_trace_log_summary(trace_data: Optional[Dict[str, Any]]) -> str:
+        if not trace_data:
+            return "none"
+        if trace_data.get('error'):
+            return f"error={trace_data.get('error')}"
+        return (
+            f"success={trace_data.get('success')}, "
+            f"spans={trace_data.get('span_count', 0)}, "
+            f"sql={trace_data.get('sql_count', 0)}, "
+            f"api_paths={len(trace_data.get('api_paths') or [])}"
+        )
+
+    def _analyze_call_chain(self, api_paths: List[str]) -> Optional[Dict[str, Any]]:
+        """Perform call chain analysis using existing analyzer.
+
+        Accepts a list of API paths and analyzes them together for efficiency.
+        """
         if not self.repo_path and not self.repo_key and not self.repo_url and not self.multi_repo_paths:
-            print(f"[CallChain] No repo_path, repo_key, repo_url or repo_urls, skipping call chain analysis for {api_path}")
+            print(f"[CallChain] No repo configured, skipping call chain analysis")
+            return None
+
+        if not api_paths:
             return None
 
         try:
             from api.analyze import JavaCallChainAnalyzer
-            print(f"[CallChain] Analyzing call chain for: {api_path}")
+            print(f"[CallChain] Analyzing call chains for {len(api_paths)} paths: {api_paths}")
 
             # Multi-repo mode: analyze first repo (call chain analysis is typically repo-specific)
             if self.multi_repo_paths:
@@ -533,7 +569,7 @@ class JiraAnalyzer:
                 analyzer = JavaCallChainAnalyzer(repo_path=self.repo_path)
             else:
                 analyzer = JavaCallChainAnalyzer(repo_key=self.repo_key)
-            result = analyzer.analyze(api_path)
+            result = analyzer.analyze(api_paths)  # Pass list directly
             print(f"[CallChain] Result: {result.get('error', 'success')}")
             return result
         except Exception as e:
@@ -546,14 +582,34 @@ class JiraAnalyzer:
     def _normalize_api_paths(api_paths: Optional[List[str]]) -> List[str]:
         if not api_paths:
             return []
+        # Flatten in case of nested lists (e.g., [['a','b']])
+        flat = []
+        for p in api_paths:
+            if isinstance(p, list):
+                flat.extend(p)
+            elif isinstance(p, str) and p:
+                # Handle JSON-serialized lists like "['/a','/b']"
+                try:
+                    # Try to parse as JSON array
+                    if p.startswith('[') and p.endswith(']'):
+                        parsed = json.loads(p)
+                        if isinstance(parsed, list):
+                            flat.extend(str(x) for x in parsed)
+                            continue
+                except Exception:
+                    pass
+                flat.append(p)
         try:
             from scripts.fetch_trace_souche import TraceFetcher
-            normalized = [
-                TraceFetcher.normalize_api_path(path)
-                for path in api_paths
-            ]
+            normalized = []
+            for path in flat:
+                result = TraceFetcher.normalize_api_path(path)
+                if isinstance(result, list):
+                    normalized.extend(result)
+                elif result:
+                    normalized.append(result)
         except Exception:
-            normalized = api_paths
+            normalized = flat
         return [path for path in dict.fromkeys(normalized) if path]
 
     def _fetch_trace_data(self, trace_id: str, date: str, cookies: str) -> Optional[Dict[str, Any]]:
@@ -705,6 +761,190 @@ class JiraAnalyzer:
                 spans, services, slowest_span, error_spans, readable_sql
             )
         }
+
+    def _extract_business_evidence(self, code_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        evidence = []
+        method_snippets = self._collect_call_chain_method_snippets(code_context.get('call_chains') or [])
+        for snippet in method_snippets:
+            hints = self._extract_business_hints_from_snippet(snippet)
+            if hints:
+                evidence.append({
+                    'type': 'code_method',
+                    'file_path': snippet.get('file_path'),
+                    'line_number': snippet.get('line_number'),
+                    'class_name': snippet.get('class_name'),
+                    'method_name': snippet.get('method_name'),
+                    'hints': hints
+                })
+
+        trace_data = code_context.get('trace_data') or {}
+        for item in self._extract_zero_result_sql(trace_data.get('sql') or []):
+            evidence.append({
+                'type': 'trace_sql_zero_result',
+                'sql': item.get('sql'),
+                'rid': item.get('rid'),
+                'service_name': item.get('service_name'),
+                'signal': item.get('zero_signal')
+            })
+
+        logs = code_context.get('logs') or {}
+        for message in logs.get('error_messages') or []:
+            if self._has_zero_signal(message):
+                evidence.append({
+                    'type': 'log_zero_result',
+                    'message': message[:240],
+                    'signal': 'zero_result'
+                })
+
+        return evidence[:12]
+
+    def _collect_call_chain_method_snippets(self, call_chains: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        snippets = []
+        seen = set()
+
+        for item in call_chains:
+            chain = item.get('call_chain') or {}
+            for node in self._flatten_call_chain_nodes(chain):
+                file_path = node.get('file_path')
+                method_name = node.get('method_name')
+                if not file_path or file_path == 'Not found' or not method_name:
+                    continue
+                key = (file_path, method_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                method_body = self._read_method_body(file_path, method_name, node.get('line_number') or 1)
+                if not method_body:
+                    continue
+                snippets.append({
+                    'file_path': file_path,
+                    'line_number': node.get('line_number') or 1,
+                    'class_name': node.get('class_name') or '',
+                    'method_name': method_name,
+                    'body': method_body
+                })
+
+        return snippets
+
+    def _flatten_call_chain_nodes(self, chain: Dict[str, Any]) -> List[Dict[str, Any]]:
+        nodes = []
+
+        def visit(value):
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+            if value.get('class_name') or value.get('method_name'):
+                nodes.append(value)
+            for child in value.get('children') or []:
+                visit(child)
+            for child in value.get('call_chain') or []:
+                visit(child)
+
+        visit(chain.get('call_chain') if isinstance(chain, dict) and chain.get('call_chain') else chain)
+        return nodes
+
+    def _read_method_body(self, file_path: str, method_name: str, line_number: int) -> str:
+        if not file_path:
+            return ''
+
+        if not os.path.exists(file_path):
+            candidate = os.path.join(os.getcwd(), file_path)
+            if os.path.exists(candidate):
+                file_path = candidate
+            else:
+                return ''
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except Exception:
+            return ''
+
+        start = max(0, line_number - 1)
+        signature_pattern = re.compile(rf'\b{re.escape(method_name)}\s*\(')
+        for idx in range(start, min(len(lines), start + 30)):
+            if signature_pattern.search(lines[idx]):
+                start = idx
+                break
+
+        body_lines = []
+        brace_count = 0
+        started = False
+        for idx in range(start, min(len(lines), start + 220)):
+            line = lines[idx]
+            if not started and '{' not in line:
+                body_lines.append(line)
+                continue
+            started = True
+            body_lines.append(line)
+            brace_count += line.count('{') - line.count('}')
+            if brace_count == 0 and idx > start:
+                break
+
+        return ''.join(body_lines)
+
+    def _extract_business_hints_from_snippet(self, snippet: Dict[str, Any]) -> List[Dict[str, Any]]:
+        body = snippet.get('body') or ''
+        if not body:
+            return []
+
+        hints = []
+        business_terms = ('在途', '卖车', '意向', '评估师', '分配', '数量', '为空', '不存在', '放弃', '不匹配')
+        evidence_markers = ('//', 'log.', 'return', 'throw', 'if ', 'if(', 'count', 'Count')
+        for index, line in enumerate(body.splitlines(), 1):
+            text = line.strip()
+            if not text:
+                continue
+            if not any(term in text for term in business_terms):
+                continue
+            if not any(marker in text for marker in evidence_markers):
+                continue
+            hints.append({
+                'line_offset': index,
+                'content': text[:260]
+            })
+            if len(hints) >= 8:
+                break
+
+        return hints
+
+    @staticmethod
+    def _extract_zero_result_sql(sql_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result = []
+        for item in sql_items:
+            text = ' '.join(str(item.get(key) or '') for key in ('sql', 'result', 'rows', 'row_count', 'count'))
+            zero_signal = JiraAnalyzer._detect_zero_signal(text)
+            if not zero_signal:
+                continue
+            enriched = dict(item)
+            enriched['zero_signal'] = zero_signal
+            result.append(enriched)
+        return result
+
+    @staticmethod
+    def _has_zero_signal(text: Any) -> bool:
+        return bool(JiraAnalyzer._detect_zero_signal(str(text or '')))
+
+    @staticmethod
+    def _detect_zero_signal(text: str) -> str:
+        if not text:
+            return ''
+        patterns = [
+            (r'\bcount\s*[:=]\s*0\b', 'count=0'),
+            (r'\brows?\s*[:=]\s*0\b', 'rows=0'),
+            (r'\brow_count\s*[:=]\s*0\b', 'row_count=0'),
+            (r'\bnums?\s*[:=]\s*0\b', 'nums=0'),
+            (r'\btotal\s*[:=]\s*0\b', 'total=0'),
+            (r'\bresult\s*[:=]\s*0\b', 'result=0'),
+            (r'\bselect\s+count\s*\([^)]*\).*?\b0\b', 'select_count_zero'),
+        ]
+        for pattern, signal in patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return signal
+        return ''
 
     def _extract_trace_search_keywords(self, trace_summary: Dict[str, Any]) -> Dict[str, List[str]]:
         error_patterns = []
@@ -1032,6 +1272,7 @@ class JiraAnalyzer:
         for entry in sql_entries[:10]:
             rid = entry.get('rid') or entry.get('id')
             sql_text = None
+            detail = None
             if rid:
                 try:
                     detail = fetcher.fetch_sql_detail(rid)
@@ -1052,10 +1293,36 @@ class JiraAnalyzer:
                 'rid': rid,
                 'service_name': entry.get('app') or entry.get('serviceName') or 'Unknown',
                 'duration_ms': entry.get('cost') or entry.get('duration') or 0,
-                'sql': sql_text
+                'sql': sql_text,
+                'result': self._extract_sql_result_signal(entry, detail)
             })
 
         return readable
+
+    @staticmethod
+    def _extract_sql_result_signal(entry: Dict[str, Any], detail: Optional[Dict[str, Any]]) -> str:
+        candidates = []
+
+        def collect(value):
+            if value is None:
+                return
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    lowered = str(key).lower()
+                    if lowered in {'result', 'rows', 'rowcount', 'row_count', 'count', 'total', 'nums', 'affectedrows'}:
+                        candidates.append(f"{key}={child}")
+                    collect(child)
+                return
+            if isinstance(value, list):
+                if not value:
+                    candidates.append("rows=0")
+                for child in value[:5]:
+                    collect(child)
+                return
+
+        collect(entry)
+        collect(detail)
+        return '; '.join(dict.fromkeys(str(item) for item in candidates if item))[:300]
 
     def _prettify_sql(self, sql: Optional[str]) -> Optional[str]:
         if not sql:
@@ -1125,6 +1392,10 @@ class JiraAnalyzer:
         code_trace_causes = self._build_code_trace_causes(jira, code_context, trace_data)
         if code_trace_causes:
             causes = code_trace_causes + causes
+        else:
+            code_context_causes = self._build_code_context_causes(jira, code_context)
+            if code_context_causes:
+                causes = code_context_causes + causes
 
         # AI-enhanced analysis
         ai_enhanced = False
@@ -1274,14 +1545,19 @@ class JiraAnalyzer:
 
         evidence_files = self._select_code_evidence_files(files, api_path, controller, controller_method)
         related_code = self._format_related_code(evidence_files, chain)
+        business_inference = self._infer_business_precondition(code_context)
         trace_error_text = primary_error.get('error_text') or primary_error.get('operation_name') or ''
         log_error_text = ''
         if logs.get('error_messages'):
             log_error_text = logs['error_messages'][0]
 
-        analysis_parts = [
-            f"Trace 在 {primary_error.get('service_name', 'Unknown')} 的 {primary_error.get('operation_name', api_path or '未知节点')} 标记为异常。"
-        ]
+        analysis_parts = []
+        if business_inference:
+            analysis_parts.append(business_inference['analysis'])
+        else:
+            analysis_parts.append(
+                f"Trace 在 {primary_error.get('service_name', 'Unknown')} 的 {primary_error.get('operation_name', api_path or '未知节点')} 标记为异常。"
+            )
         if controller_text:
             analysis_parts.append(f"该链路已映射到代码入口 {controller_text}，问题应优先沿这个入口的调用链排查。")
         if trace_error_text:
@@ -1294,33 +1570,148 @@ class JiraAnalyzer:
                 f"代码搜索命中 {top.get('file_path')}，关键词为 {top.get('keyword')}，说明异常线索和代码路径存在交集。"
             )
 
-        suggestion_parts = [
-            f"从 {controller_text} 开始检查入参、空值判断、业务规则分支和下游服务返回。" if controller_text else "从 Trace 异常节点对应的接口入口开始检查。",
-            "结合 Trace 中的异常节点和慢节点，逐层核对调用链中的 Service/DAO 方法。",
-            "如果命中 SQL 表名，继续检查查询条件、分页参数、数据权限和空结果处理。"
-        ]
+        if business_inference:
+            suggestion_parts = business_inference['suggestions']
+        else:
+            suggestion_parts = [
+                f"从 {controller_text} 开始检查入参、空值判断、业务规则分支和下游服务返回。" if controller_text else "从 Trace 异常节点对应的接口入口开始检查。",
+                "结合 Trace 中的异常节点和慢节点，逐层核对调用链中的 Service/DAO 方法。",
+                "如果命中 SQL 表名，继续检查查询条件、分页参数、数据权限和空结果处理。"
+            ]
 
         cause = {
             'id': 'trace_code_path',
-            'category': '代码路径异常',
+            'category': business_inference.get('category', '代码路径异常') if business_inference else '代码路径异常',
             'analysis': ''.join(analysis_parts),
             'suggestion': '\n'.join(f"{index + 1}. {item}" for index, item in enumerate(suggestion_parts)),
-            'confidence': 0.86 if evidence_files else 0.78,
+            'confidence': business_inference.get('confidence', 0.86 if evidence_files else 0.78) if business_inference else (0.86 if evidence_files else 0.78),
             'related_code': related_code,
             'evidence_files': evidence_files[:5],
+            'business_evidence': code_context.get('business_evidence') or [],
             'trace_error_node': primary_error,
             'api_path': api_path
         }
 
         return [cause]
 
+    def _build_code_context_causes(
+        self,
+        jira: Dict[str, Any],
+        code_context: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        call_chains = code_context.get('call_chains') or []
+        files = code_context.get('files') or []
+        if not call_chains and not files:
+            return []
+
+        chain = call_chains[0].get('call_chain') if call_chains else {}
+        chain = chain or {}
+        api_path = self._stringify_api_path(
+            call_chains[0].get('api_path') if call_chains else ''
+        )
+        controller = chain.get('controller') or ''
+        controller_method = chain.get('controller_method') or ''
+        controller_text = (
+            f"{controller}.{controller_method}()"
+            if controller and controller_method
+            else api_path or '相关代码入口'
+        )
+        evidence_files = self._select_code_evidence_files(files, api_path, controller, controller_method)
+        related_code = self._format_related_code(evidence_files, chain)
+        business_inference = self._infer_business_precondition(code_context)
+
+        analysis_parts = []
+        if business_inference:
+            analysis_parts.append(business_inference['analysis'])
+        elif api_path or controller or controller_method:
+            analysis_parts.append(f"已根据服务/接口线索映射到代码入口 {controller_text}。")
+        if files:
+            top = evidence_files[0] if evidence_files else files[0]
+            analysis_parts.append(
+                f"代码搜索命中 {len(files)} 个相关文件，首要命中为 {top.get('file_path')}，关键词为 {top.get('keyword')}。"
+            )
+        if not analysis_parts:
+            analysis_parts.append(f"已获取 JIRA「{jira.get('summary', '')}」对应的代码上下文。")
+
+        suggestion_parts = business_inference['suggestions'] if business_inference else [
+            f"优先检查 {controller_text} 的入参校验、权限判断、业务状态分支和下游调用返回。",
+            "查看命中文件中的关键词上下文，确认是否与 JIRA 描述的问题现象一致。",
+            "如果问题与数据异常相关，继续沿 Service/DAO 调用检查查询条件、数据权限和状态更新。"
+        ]
+
+        return [{
+            'id': 'code_context_path',
+            'category': business_inference.get('category', '代码证据分析') if business_inference else '代码证据分析',
+            'analysis': ''.join(analysis_parts),
+            'suggestion': '\n'.join(f"{index + 1}. {item}" for index, item in enumerate(suggestion_parts)),
+            'confidence': business_inference.get('confidence', 0.74 if evidence_files else 0.62) if business_inference else (0.74 if evidence_files else 0.62),
+            'related_code': related_code,
+            'evidence_files': evidence_files[:5],
+            'business_evidence': code_context.get('business_evidence') or [],
+            'api_path': api_path
+        }]
+
+    def _infer_business_precondition(self, code_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        evidence = code_context.get('business_evidence') or []
+        if not evidence:
+            return None
+
+        evidence_text = ' '.join(
+            json.dumps(item, ensure_ascii=False)
+            for item in evidence
+        )
+        has_sell_car_intention = all(term in evidence_text for term in ('卖车', '在途')) and '意向' in evidence_text
+        has_zero_result = any(
+            item.get('type') in {'trace_sql_zero_result', 'log_zero_result'}
+            for item in evidence
+        ) or self._has_zero_signal(evidence_text)
+        has_assessor_distribution = '评估师' in evidence_text and '分配' in evidence_text
+        has_explicit_missing_intention = '不存在在途的卖车意向' in evidence_text
+
+        if has_sell_car_intention and (has_zero_result or has_explicit_missing_intention):
+            action = '分配评估师' if has_assessor_distribution else '当前操作'
+            runtime_text = (
+                "Trace/日志证据中相关查询返回 0，说明当前客户没有命中在途卖车意向数据，"
+                if has_zero_result
+                else "代码中存在“不存在在途的卖车意向，无法分配评估师”的明确失败分支，"
+            )
+            return {
+                'category': '业务前置条件未满足',
+                'analysis': (
+                    f"代码证据显示{action}依赖客户存在在途卖车意向；"
+                    f"{runtime_text}"
+                    "因此更可能是业务前置条件不满足，而不是单纯的入参、权限或下游调用异常。"
+                ),
+                'suggestions': [
+                    "核对该客户是否存在 is_sell_car=是 且 operation/access phase 处于在途集合的卖车意向。",
+                    "用 Trace 中的 SQL 参数复查意向表，确认 customerId、评估师、阶段条件是否导致查询结果为 0。",
+                    "如果业务上允许分配，先补齐或修复该客户的在途卖车意向；如果不允许，前端/产品应在操作入口提示不可分配原因。"
+                ],
+                'confidence': 0.9 if has_zero_result else 0.84
+            }
+
+        return None
+
     @staticmethod
     def _pick_primary_api_path(trace_data: Dict[str, Any], call_chains: List[Dict[str, Any]]) -> str:
         for chain in call_chains:
             if chain.get('api_path'):
-                return chain['api_path']
+                return JiraAnalyzer._stringify_api_path(chain['api_path'])
         paths = trace_data.get('api_paths') or []
-        return paths[0] if paths else ''
+        # Flatten in case api_paths contains nested lists
+        flat_paths = []
+        for p in paths:
+            if isinstance(p, list):
+                flat_paths.extend(p)
+            elif isinstance(p, str):
+                flat_paths.append(p)
+        return flat_paths[0] if flat_paths else ''
+
+    @staticmethod
+    def _stringify_api_path(api_path: Any) -> str:
+        if isinstance(api_path, list):
+            return api_path[0] if api_path else ''
+        return api_path or ''
 
     @staticmethod
     def _pick_call_chain_for_api(api_path: str, call_chains: List[Dict[str, Any]]) -> Dict[str, Any]:

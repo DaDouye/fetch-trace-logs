@@ -104,8 +104,21 @@ class JavaCallChainAnalyzer:
                 return clone_path
         return None
 
-    def analyze(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
-        api_path = self._normalize_api_path(api_path)
+    def analyze(self, api_path: Union[str, List[str]], trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
+        normalized_paths = self._normalize_api_paths(api_path)
+        if not normalized_paths:
+            return {'error': 'API path 不能为空', 'api_path': api_path}
+
+        if len(normalized_paths) == 1:
+            return self._analyze_single(normalized_paths[0], trace_id, date, cookies)
+
+        results = []
+        for path in normalized_paths:
+            r = self._analyze_single(path, trace_id, date, cookies)
+            results.append(r)
+        return self._merge_analyze_results(results)
+
+    def _analyze_single(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
         if api_path.endswith('.json'):
             api_path = api_path[:-5]
         if api_path.endswith('/'):
@@ -138,13 +151,65 @@ class JavaCallChainAnalyzer:
 
         return result
 
+    def _merge_analyze_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge results from multiple path analyses.
+
+        Returns the first successful result with merged call_chains from all results.
+        This maintains backward compatibility with the caller's expected structure.
+        """
+        first_success = None
+        merged_call_chains = []
+        all_controllers = []
+        all_api_paths = []
+
+        for r in results:
+            all_api_paths.append(r.get('api_path'))
+            if r.get('controller'):
+                all_controllers.append(r['controller'])
+            if r.get('call_chain'):
+                merged_call_chains.extend(r['call_chain'])
+            if first_success is None and not r.get('error'):
+                first_success = r
+
+        if not first_success:
+            # All failed - return first error
+            return results[0]
+
+        # Return first success result with merged call_chains
+        first_success['call_chain'] = merged_call_chains
+        first_success['controllers'] = all_controllers
+        first_success['api_path'] = all_api_paths
+        return first_success
+
     @staticmethod
-    def _normalize_api_path(api_path: str) -> str:
+    def _normalize_api_path(api_path: str) -> Union[str, List[str]]:
         try:
             from scripts.fetch_trace_souche import TraceFetcher
-            return TraceFetcher.normalize_api_path(api_path) or (api_path or '').strip()
+            result = TraceFetcher.normalize_api_path(api_path)
+            # Returns str or list - let analyze() handle it
+            return result if result else (api_path or '').strip()
         except Exception:
             return (api_path or '').strip()
+
+    def _normalize_api_paths(self, api_path: Union[str, List[str]]) -> List[str]:
+        raw_paths = api_path if isinstance(api_path, list) else [api_path]
+        normalized_paths = []
+
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+
+            normalized = self._normalize_api_path(raw_path)
+            if isinstance(normalized, list):
+                candidates = normalized
+            else:
+                candidates = [normalized]
+
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    normalized_paths.append(candidate.strip())
+
+        return list(dict.fromkeys(normalized_paths))
 
     def _read_file(self, file_path: str) -> Optional[str]:
         """读取文件内容，兼容本地和远程模式"""
@@ -354,9 +419,10 @@ class JavaCallChainAnalyzer:
                 if brace_count == 0 and method_start != i:
                     break
 
-                # 匹配 xxxService.method() 或 xxxMapper.method() 或 xxxDAO.method()
+                # 匹配 xxxService.method()、xxxMapper.method()、xxxDAO.method()
+                # 以及部分无后缀的 Spring Bean 字段，如 distributeCustomer.method()
                 service_call_match = re.search(
-                    r'(\w+Service|\w+DAO|\w+Mapper|\w+Manager)\.(\w+)\s*\(',
+                    r'\b(\w+)\.(\w+)\s*\(',
                     line
                 )
                 if service_call_match:
@@ -364,7 +430,11 @@ class JavaCallChainAnalyzer:
                     service_field = service_call_match.group(1)
                     service_method = service_call_match.group(2)
 
-                    if service_method not in self.EXCLUDED_METHODS:
+                    if service_method not in self.EXCLUDED_METHODS and service_field not in {
+                        'this', 'super', 'log', 'JSON', 'JSONObject', 'Objects', 'StringUtils',
+                        'CollectionUtils', 'CollectionUtil', 'Collections', 'Lists', 'Maps',
+                        'Exceptionz', 'Result', 'DistributionVO', 'DateUtil'
+                    }:
                         yield {'class': service_field, 'method': service_method, 'line': line_no}
 
     def _extract_this_method_calls(self, content: str, method_name: str, start_line: int) -> List[Dict]:
@@ -399,6 +469,8 @@ class JavaCallChainAnalyzer:
         """追踪外部服务调用"""
         impl_path = self._find_service_impl(service_field)
         if not impl_path:
+            if not any(service_field.endswith(suffix) for suffix in ['Service', 'DAO', 'Mapper', 'Manager', 'Repository']):
+                return None
             return CallChainNode(layer='Service', class_name=service_field, method_name=method_name,
                                file_path='Not found', line_number=line_number)
 
@@ -422,6 +494,10 @@ class JavaCallChainAnalyzer:
                 dao_node = self._trace_dao_call(call['class'], call['method'], call['line'])
                 if dao_node:
                     service_node.children.append(dao_node)
+            elif 'Service' in call['class'] or self._find_service_impl(call['class']):
+                child_node = self._trace_call(call['class'], call['method'], call['line'])
+                if child_node:
+                    service_node.children.append(child_node)
 
         # 提取 this. 形式的内部方法调用
         internal_calls = list(self._extract_this_method_calls(impl_content, impl_method['name'], impl_method['line']))
@@ -454,7 +530,7 @@ class JavaCallChainAnalyzer:
                 dao_node = self._trace_dao_call(call['class'], call['method'], call['line'])
                 if dao_node:
                     internal_node.children.append(dao_node)
-            elif 'Service' in call['class']:
+            elif 'Service' in call['class'] or self._find_service_impl(call['class']):
                 service_node = self._trace_call(call['class'], call['method'], call['line'])
                 if service_node:
                     internal_node.children.append(service_node)
@@ -497,23 +573,28 @@ class JavaCallChainAnalyzer:
         # 处理 i 前缀约定: iCustomerService -> CustomerServiceImpl
         if base_name.startswith('I') and len(base_name) > 1:
             base_name = base_name[0].lower() + base_name[1:]
-        elif base_name.startswith('i'):
+        elif base_name.startswith('i') and len(base_name) > 1 and base_name[1].isupper():
             base_name = base_name[1:]
-        impl_name = base_name + 'ServiceImpl.java'
+        impl_names = [base_name + 'ServiceImpl.java']
+        if base_name:
+            impl_names.append(base_name[0].upper() + base_name[1:] + 'ServiceImpl.java')
+            impl_names.append(base_name[0].upper() + base_name[1:] + 'Impl.java')
+            impl_names.append(base_name + 'Impl.java')
 
         if self._use_remote:
             # 远程模式：搜索文件
-            impl_path = self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/service/impl', impl_name)
-            if impl_path:
-                self._service_impl_cache[service_interface] = impl_path
-                return impl_path
+            for impl_name in impl_names:
+                impl_path = self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/service/impl', impl_name)
+                if impl_path:
+                    self._service_impl_cache[service_interface] = impl_path
+                    return impl_path
         else:
             # 本地模式
             impl_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/service/impl')
             if os.path.exists(impl_dir):
                 for root, dirs, files in os.walk(impl_dir):
                     for file in files:
-                        if file.lower() == impl_name.lower():
+                        if any(file.lower() == impl_name.lower() for impl_name in impl_names):
                             impl_path = os.path.join(root, file)
                             self._service_impl_cache[service_interface] = impl_path
                             return impl_path
