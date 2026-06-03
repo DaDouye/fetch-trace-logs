@@ -13,6 +13,17 @@
           </n-form-item>
         </n-gi>
         <n-gi span="2">
+          <n-form-item label="代码版本 commit SHA" path="lockedRef">
+            <n-input
+              v-model:value="formValue.lockedRef"
+              placeholder="请输入固定 commit SHA，不支持 master/main/HEAD"
+            />
+          </n-form-item>
+        </n-gi>
+      </n-grid>
+
+      <n-grid :cols="3" :x-gap="16" responsive="screen" item-responsive>
+        <n-gi span="3">
           <n-form-item label="API 路径（可选）" path="apiPath">
             <n-input
               v-model:value="formValue.apiPath"
@@ -74,6 +85,7 @@ const store = useAnalyzerStore()
 const formRef = ref(null)
 const formValue = ref({
   repoKey: null,
+  lockedRef: '',
   apiPath: '',
   traceId: '',
   date: null,
@@ -81,7 +93,8 @@ const formValue = ref({
 })
 
 const rules = {
-  repoKey: { required: true, message: '请选择仓库', trigger: 'change' }
+  repoKey: { required: true, message: '请选择仓库', trigger: 'change' },
+  lockedRef: { required: true, message: '请输入固定 commit SHA', trigger: 'blur' }
 }
 
 const repoOptions = computed(() =>
@@ -100,7 +113,8 @@ function handleAnalyze() {
     if (errors) return
 
     const params = {
-      repo_key: formValue.value.repoKey
+      repo_key: formValue.value.repoKey,
+      locked_ref: formValue.value.lockedRef.trim()
     }
 
     const apiPath = formValue.value.apiPath.trim()

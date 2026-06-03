@@ -29,7 +29,7 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
       const res = await analyzeApi(params)
       result.value = res.data
     } catch (e) {
-      error.value = e.response?.data?.detail || e.message || '分析失败'
+      error.value = e.response?.data?.detail?.message || e.response?.data?.detail || e.message || '分析失败'
     } finally {
       loading.value = false
     }
@@ -46,7 +46,7 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
       const res = await analyzeJira(params)
       jiraResult.value = res.data
     } catch (e) {
-      error.value = e.response?.data?.detail || e.message || 'JIRA 分析失败'
+      error.value = e.response?.data?.detail?.message || e.response?.data?.detail || e.message || 'JIRA 分析失败'
     } finally {
       loading.value = false
     }

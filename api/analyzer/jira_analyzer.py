@@ -4,7 +4,6 @@ JIRA Problem Analyzer - Unified analysis orchestration
 """
 
 import os
-import hashlib
 import re
 import glob
 from typing import Optional, Dict, Any, List
@@ -19,6 +18,7 @@ from api.jira_client import JiraClient
 from api.analyzer.rule_engine import RuleEngine
 from api.analyzer.code_search import CodeSearch
 from api.analyzer.claude_code_service import ClaudeCodeAnalysisService
+from api.analyzer.repository_context import LockedRepoContext, prepare_locked_repo
 from api.analyzer.lightrag_indexer import LightRAGIndexer
 
 
@@ -34,7 +34,8 @@ class JiraAnalyzer:
         repo_path: str = None,
         repo_url: str = None,
         repo_urls: List[Dict[str, str]] = None,
-        ref: str = "master"
+        ref: str = None,
+        locked_ref: str = None
     ):
         """
         Initialize analyzer
@@ -43,47 +44,45 @@ class JiraAnalyzer:
         :param repo_path: Direct repository path (alternative to repo_key)
         :param repo_url: Remote Git URL (alternative to repo_key)
         :param repo_urls: List of Git URLs (alternative to repo_key, supports multiple repos)
-        :param ref: Git branch/commit (used with repo_url)
+        :param ref: 兼容字段；仅当为 commit SHA 时可作为 locked_ref
+        :param locked_ref: 固定 commit SHA
         """
         self.repo_key = repo_key
         self.repo_url = repo_url
-        self.ref = ref
-        self.repo_urls = repo_urls  # List of {repo_url, ref} dicts
+        self.ref = locked_ref or ref
+        self.locked_ref = locked_ref
+        self.repo_urls = repo_urls  # List of {repo_url, ref, locked_ref} dicts
+        self.locked_repo_context: Optional[LockedRepoContext] = None
 
         if repo_path:
             self.repo_path = repo_path
         elif repo_url:
-            self.repo_path = self._clone_or_get_local_repo(repo_url, ref) if self._is_repo_url(repo_url) else None
+            self.locked_repo_context = self._prepare_locked_repo(repo_url, locked_ref, ref) if self._is_repo_url(repo_url) else None
+            self.repo_path = self.locked_repo_context.local_path if self.locked_repo_context else None
         elif repo_key:
             repo_url_for_key = self._repo_url_from_key(repo_key)
             self.repo_url = repo_url_for_key
-            self.repo_path = self._clone_or_get_local_repo(repo_url_for_key, ref) if repo_url_for_key else None
+            self.locked_repo_context = self._prepare_locked_repo(repo_url_for_key, locked_ref, ref) if repo_url_for_key else None
+            self.repo_path = self.locked_repo_context.local_path if self.locked_repo_context else None
         else:
             self.repo_path = None
 
-        # If repo_urls is provided (multiple repos), clone all to local
         self.multi_repo_paths = []
         if self.repo_urls:
             for repo_info in self.repo_urls:
-                # Support both dict and Pydantic model
                 r_url = repo_info.get('repo_url') if isinstance(repo_info, dict) else repo_info.repo_url
-                r_ref = repo_info.get('ref', 'master') if isinstance(repo_info, dict) else getattr(repo_info, 'ref', 'master')
+                r_ref = repo_info.get('ref') if isinstance(repo_info, dict) else getattr(repo_info, 'ref', None)
+                r_locked_ref = repo_info.get('locked_ref') if isinstance(repo_info, dict) else getattr(repo_info, 'locked_ref', None)
                 if not self._is_repo_url(r_url):
                     print(f"[JiraAnalyzer] Skipping non-repository input: {r_url}")
                     continue
-                local_path = self._clone_or_get_local_repo(r_url, r_ref)
-                if local_path:
-                    self.multi_repo_paths.append({
-                        'repo_url': r_url,
-                        'ref': r_ref,
-                        'local_path': local_path
-                    })
+                context = self._prepare_locked_repo(r_url, r_locked_ref or locked_ref, r_ref or ref)
+                self.multi_repo_paths.append(self._locked_context_to_repo_info(context))
             print(f"[JiraAnalyzer] Initialized with {len(self.multi_repo_paths)} repos")
 
         self.jira_client = JiraClient()
         self.rule_engine = RuleEngine()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
-        # For multi-repo mode, we don't use single code_search but search each repo separately
         self._claude_services: Dict[str, ClaudeCodeAnalysisService] = {}
         self._rag_indexer = None
 
@@ -140,47 +139,20 @@ class JiraAnalyzer:
             or value.startswith("ssh://")
         )
 
-    def _clone_or_get_local_repo(self, repo_url: str, ref: str = "master") -> str:
-        """
-        Clone remote repository or get existing local repository path
+    @staticmethod
+    def _prepare_locked_repo(repo_url: str, locked_ref: str = None, ref: str = None) -> LockedRepoContext:
+        return prepare_locked_repo(repo_url, locked_ref or ref)
 
-        :param repo_url: Remote repository URL
-        :return: Local repository path
-        """
-        import git
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
-        safe_ref = re.sub(r'[^A-Za-z0-9_.-]+', '_', ref or 'master')
-        repo_hash = hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:8]
-        local_path = os.path.join('./repos', f"{repo_name}-{safe_ref}-{repo_hash}")
-
-        # Check if local repo exists
-        if os.path.exists(local_path):
-            print(f"[JiraAnalyzer] Repo already exists: {local_path}, pulling...")
-            try:
-                existing_repo = git.Repo(local_path)
-                existing_repo.remotes.origin.fetch(ref)
-                self._checkout_ref(existing_repo, ref)
-            except Exception as e:
-                print(f"[JiraAnalyzer] Pull failed: {e}, will use existing")
-        else:
-            print(f"[JiraAnalyzer] Cloning repo: {repo_url} ({ref})")
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            try:
-                repo = git.Repo.clone_from(repo_url, local_path)
-                self._checkout_ref(repo, ref)
-            except Exception as e:
-                print(f"[JiraAnalyzer] Clone failed: {e}")
-                return None
-
-        return local_path
-
-    def _checkout_ref(self, repo, ref: str):
-        if not ref:
-            return
-        try:
-            repo.git.checkout(ref)
-        except Exception:
-            repo.git.checkout("FETCH_HEAD")
+    @staticmethod
+    def _locked_context_to_repo_info(context: LockedRepoContext) -> Dict[str, Any]:
+        return {
+            'repo_url': context.repo_url,
+            'ref': context.locked_ref,
+            'locked_ref': context.locked_ref,
+            'resolved_commit': context.resolved_commit,
+            'fetched_missing_commit': context.fetched_missing_commit,
+            'local_path': context.local_path
+        }
 
     def _ensure_repo_context_from_services(self, services: List[str]) -> None:
         """Infer repository context from service names when the request omitted repo fields."""
@@ -210,19 +182,18 @@ class JiraAnalyzer:
         if len(matched) == 1:
             repo = matched[0]
             self.repo_key = repo['key']
-            self.repo_path = self._clone_or_get_local_repo(repo['url'], 'master')
+            self.repo_url = repo['url']
+            context = self._prepare_locked_repo(repo['url'], self.locked_ref, self.ref)
+            self.locked_repo_context = context
+            self.repo_path = context.local_path
             self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
             print(f"[JiraAnalyzer] Auto-selected repo {repo['key']} for services: {services}")
             return
 
         self.multi_repo_paths = []
         for repo in matched:
-            local_path = self._clone_or_get_local_repo(repo['url'], 'master')
-            self.multi_repo_paths.append({
-                'repo_url': repo['url'],
-                'ref': 'master',
-                'local_path': local_path
-            })
+            context = self._prepare_locked_repo(repo['url'], self.locked_ref, self.ref)
+            self.multi_repo_paths.append(self._locked_context_to_repo_info(context))
         print(f"[JiraAnalyzer] Auto-selected {len(self.multi_repo_paths)} repos for services: {services}")
 
     @staticmethod
@@ -583,7 +554,7 @@ class JiraAnalyzer:
                     logs=logs,
                     search_keywords=keywords,
                     user_context=user_context,
-                    ref=repo_info.get('ref', 'master')
+                    ref=repo_info.get('resolved_commit') or repo_info.get('locked_ref')
                 )
                 repo_url = repo_info.get('repo_url')
                 for item in result.get('files', []):
@@ -597,7 +568,9 @@ class JiraAnalyzer:
                 warnings.extend(result.get('warnings', []))
                 metadata['repos'].append({
                     'repo_url': repo_url,
-                    'ref': repo_info.get('ref', 'master'),
+                    'locked_ref': repo_info.get('locked_ref'),
+                    'resolved_commit': repo_info.get('resolved_commit'),
+                    'fetched_missing_commit': repo_info.get('fetched_missing_commit'),
                     'metadata': result.get('metadata', {})
                 })
             return {
@@ -625,7 +598,7 @@ class JiraAnalyzer:
             repo_info = self.multi_repo_paths[0]
             return self._get_claude_service(repo_info.get('local_path')).analyze_call_chain(
                 api_path=api_path,
-                ref=repo_info.get('ref', 'master')
+                ref=repo_info.get('resolved_commit') or repo_info.get('locked_ref')
             )
         return self._get_claude_service().analyze_call_chain(api_path=api_path, ref=self.ref)
 
@@ -1282,7 +1255,7 @@ class JiraAnalyzer:
                     rule_causes=rule_causes,
                     user_context=user_context,
                     rag_context=rag_context,
-                    ref=repo_info.get('ref', 'master')
+                    ref=repo_info.get('resolved_commit') or repo_info.get('locked_ref')
                 )
                 repo_url = repo_info.get('repo_url')
                 for cause in result.get('possible_causes', []):
@@ -1292,7 +1265,9 @@ class JiraAnalyzer:
                     summaries.append(result['summary'])
                 metadata['repos'].append({
                     'repo_url': repo_url,
-                    'ref': repo_info.get('ref', 'master'),
+                    'locked_ref': repo_info.get('locked_ref'),
+                    'resolved_commit': repo_info.get('resolved_commit'),
+                    'fetched_missing_commit': repo_info.get('fetched_missing_commit'),
                     'metadata': result.get('metadata', {})
                 })
             return {

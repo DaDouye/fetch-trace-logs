@@ -18,6 +18,7 @@ load_dotenv()
 
 from api.analyze import JavaCallChainAnalyzer
 from api.analyzer.claude_code_service import ClaudeCodeAnalysisError
+from api.analyzer.repository_context import RepositoryContextError
 from config_manager import get_all_git_repos
 
 app = FastAPI(
@@ -45,7 +46,8 @@ class AnalyzeRequest(BaseModel):
     api_path: Optional[str] = None  # 如 "/v1/customerAction/saveOrUpdateCustomer"，可由 Trace ID 自动识别
     repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
     repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
-    ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
+    ref: Optional[str] = None               # 兼容字段：仅当为 commit SHA 时可作为 locked_ref
+    locked_ref: Optional[str] = None        # 固定代码分析版本 commit SHA
     trace_id: Optional[str] = None   # 可选，用于获取运行时数据
     date: Optional[str] = None       # 可选，如 "2026-04-23"
     cookies: Optional[str] = None     # 可选，trace API 认证 cookies
@@ -54,7 +56,8 @@ class AnalyzeRequest(BaseModel):
 class RepoInfo(BaseModel):
     """单个仓库信息"""
     repo_url: str
-    ref: str = "master"
+    ref: Optional[str] = None
+    locked_ref: Optional[str] = None
 
 
 class AnalyzeJiraRequest(BaseModel):
@@ -62,7 +65,8 @@ class AnalyzeJiraRequest(BaseModel):
     jira_url: str                    # JIRA URL (必填)
     repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_urls 二选一)
     repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库) - 兼容旧版
-    ref: str = "master"               # Git 分支/ commit (配合 repo_url 使用)
+    ref: Optional[str] = None               # 兼容字段：仅当为 commit SHA 时可作为 locked_ref
+    locked_ref: Optional[str] = None        # 固定代码分析版本 commit SHA
     repo_urls: Optional[List[RepoInfo]] = None  # Git 仓库 URL 列表 (支持多仓库)
     api_paths: Optional[List[str]] = None  # API 路径列表 (可选)
     trace_id: Optional[str] = None    # Trace ID (可选)
@@ -121,9 +125,9 @@ async def analyze_api(req: AnalyzeRequest):
     """
     try:
         if req.repo_url:
-            analyzer = JavaCallChainAnalyzer(repo_url=req.repo_url, ref=req.ref)
+            analyzer = JavaCallChainAnalyzer(repo_url=req.repo_url, ref=req.ref, locked_ref=req.locked_ref)
         elif req.repo_key:
-            analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key)
+            analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key, ref=req.ref, locked_ref=req.locked_ref)
         else:
             raise HTTPException(
                 status_code=400,
@@ -156,6 +160,11 @@ async def analyze_api(req: AnalyzeRequest):
         raise HTTPException(status_code=502, detail={
             "message": str(e),
             "analysis_engine": "claude_code_cli",
+            "details": e.details
+        })
+    except RepositoryContextError as e:
+        raise HTTPException(status_code=400, detail={
+            "message": str(e),
             "details": e.details
         })
     except ValueError as e:
@@ -194,11 +203,11 @@ async def analyze_jira(req: AnalyzeJiraRequest):
 
         # 支持多仓库
         if req.repo_urls:
-            analyzer = JiraAnalyzer(repo_urls=req.repo_urls)
+            analyzer = JiraAnalyzer(repo_urls=req.repo_urls, ref=req.ref, locked_ref=req.locked_ref)
         elif req.repo_url:
-            analyzer = JiraAnalyzer(repo_url=req.repo_url, ref=req.ref)
+            analyzer = JiraAnalyzer(repo_url=req.repo_url, ref=req.ref, locked_ref=req.locked_ref)
         else:
-            analyzer = JiraAnalyzer(repo_key=req.repo_key)
+            analyzer = JiraAnalyzer(repo_key=req.repo_key, ref=req.ref, locked_ref=req.locked_ref)
         result = analyzer.analyze(
             jira_url=req.jira_url,
             api_paths=req.api_paths,
@@ -229,6 +238,11 @@ async def analyze_jira(req: AnalyzeJiraRequest):
         raise HTTPException(status_code=502, detail={
             "message": str(e),
             "analysis_engine": "claude_code_cli",
+            "details": e.details
+        })
+    except RepositoryContextError as e:
+        raise HTTPException(status_code=400, detail={
+            "message": str(e),
             "details": e.details
         })
     except ValueError as e:

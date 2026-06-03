@@ -19,10 +19,11 @@ import pickle
 from pathlib import Path
 import logging
 from config_manager import get_git_repo_url, load_config
+from api.analyzer.repository_context import LockedRepoContext, prepare_locked_repo
 
 
 class GitLogRAG:
-    def __init__(self, repo_path=None, repo_key=None, log_file_path=None, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, repo_path=None, repo_key=None, log_file_path=None, model_name="sentence-transformers/all-MiniLM-L6-v2", locked_ref=None, ref=None):
         """
         初始化 RAG 系统
 
@@ -36,8 +37,8 @@ class GitLogRAG:
         if repo_key:
             repo_url = get_git_repo_url(repo_key)
             if repo_url:
-                # 如果是远程仓库URL，需要先克隆
-                self.repo_path = self._clone_or_get_local_repo(repo_url)
+                self.locked_repo_context = self._clone_or_get_local_repo(repo_url, locked_ref or ref)
+                self.repo_path = self.locked_repo_context.local_path
             else:
                 raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
         elif repo_path:
@@ -53,31 +54,18 @@ class GitLogRAG:
         self.qa_chain = None
         self.setup_logging()
 
-    def _clone_or_get_local_repo(self, repo_url):
+    def _clone_or_get_local_repo(self, repo_url, locked_ref) -> LockedRepoContext:
         """
-        克隆远程仓库或获取已存在的本地仓库路径
+        准备锁定到固定 commit 的本地仓库。
 
         Args:
             repo_url (str): 远程仓库URL
+            locked_ref (str): 固定 commit SHA
 
         Returns:
-            str: 本地仓库路径
+            LockedRepoContext: 锁定版本仓库上下文
         """
-        # 从URL中提取仓库名
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
-        local_path = os.path.join('./repos', repo_name)
-
-        # 检查本地是否存在该仓库
-        if os.path.exists(local_path):
-            print(f"仓库已存在: {local_path}，正在更新...")
-            existing_repo = git.Repo(local_path)
-            existing_repo.remotes.origin.pull()
-        else:
-            print(f"正在克隆仓库: {repo_url}")
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            git.Repo.clone_from(repo_url, local_path)
-
-        return local_path
+        return prepare_locked_repo(repo_url, locked_ref)
 
     def setup_logging(self):
         """设置日志记录"""

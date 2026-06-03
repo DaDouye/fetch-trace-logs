@@ -9,7 +9,6 @@ import os
 import re
 import glob
 import json
-import hashlib
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
@@ -17,6 +16,7 @@ from pathlib import Path
 
 from api.git_fetcher import get_git_fetcher, GitFetcher
 from api.analyzer.claude_code_service import ClaudeCodeAnalysisService
+from api.analyzer.repository_context import LockedRepoContext, prepare_locked_repo
 
 
 @dataclass
@@ -50,20 +50,23 @@ class JavaCallChainAnalyzer:
         repo_path: str = None,
         repo_key: str = None,
         repo_url: str = None,
-        ref: str = "master"
+        ref: str = None,
+        locked_ref: str = None
     ):
         """
         初始化分析器
 
         :param repo_path: 本地仓库路径（优先使用）
         :param repo_key: 仓库键名（从 config 获取 URL）
-        :param repo_url: 远程仓库 URL（直接指定，使用 GitFetcher）
-        :param ref: Git 分支/ commit（配合 repo_url 使用）
+        :param repo_url: 远程仓库 URL（直接指定）
+        :param ref: 兼容字段；仅当它是 commit SHA 时可作为 locked_ref
+        :param locked_ref: 固定 commit SHA
         """
         self._git_fetcher: Optional[GitFetcher] = None
         self._use_remote = False
         self.repo_url = repo_url
-        self.ref = ref
+        self.ref = locked_ref or ref
+        self.locked_repo_context: Optional[LockedRepoContext] = None
 
         if repo_path:
             self.repo_path = repo_path
@@ -74,13 +77,12 @@ class JavaCallChainAnalyzer:
             if not url:
                 raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
             self.repo_url = url
-            local_repo_path = self._resolve_local_repo_path(url)
-            if not local_repo_path:
-                local_repo_path = self._clone_or_get_local_repo(url, ref)
-            self.repo_path = local_repo_path
+            self.locked_repo_context = self._prepare_locked_repo(url, locked_ref, ref)
+            self.repo_path = self.locked_repo_context.local_path
             self._use_remote = False
         elif repo_url:
-            self.repo_path = self._clone_or_get_local_repo(repo_url, ref)
+            self.locked_repo_context = self._prepare_locked_repo(repo_url, locked_ref, ref)
+            self.repo_path = self.locked_repo_context.local_path
             self._use_remote = False
         else:
             raise ValueError("必须提供 repo_path、repo_key 或 repo_url 参数")
@@ -94,48 +96,8 @@ class JavaCallChainAnalyzer:
         self._mapper_sql_cache: Dict[str, Dict[str, str]] = {}
 
     @staticmethod
-    def _resolve_local_repo_path(repo_url: str) -> Optional[str]:
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
-        direct_path = os.path.join('./repos', repo_name)
-        if os.path.isdir(direct_path):
-            return direct_path
-
-        existing_clones = sorted(glob.glob(os.path.join('./repos', f"{repo_name}-*")))
-        for clone_path in existing_clones:
-            if os.path.isdir(clone_path):
-                return clone_path
-        return None
-
-    @staticmethod
-    def _clone_or_get_local_repo(repo_url: str, ref: str = "master") -> str:
-        import git
-        repo_name = repo_url.split('/')[-1].replace('.git', '')
-        safe_ref = re.sub(r'[^A-Za-z0-9_.-]+', '_', ref or 'master')
-        repo_hash = hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:8]
-        local_path = os.path.join('./repos', f"{repo_name}-{safe_ref}-{repo_hash}")
-
-        if os.path.exists(local_path):
-            repo = git.Repo(local_path)
-            try:
-                repo.remotes.origin.fetch(ref)
-                JavaCallChainAnalyzer._checkout_ref(repo, ref)
-            except Exception:
-                pass
-            return local_path
-
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        repo = git.Repo.clone_from(repo_url, local_path)
-        JavaCallChainAnalyzer._checkout_ref(repo, ref)
-        return local_path
-
-    @staticmethod
-    def _checkout_ref(repo, ref: str) -> None:
-        if not ref:
-            return
-        try:
-            repo.git.checkout(ref)
-        except Exception:
-            repo.git.checkout("FETCH_HEAD")
+    def _prepare_locked_repo(repo_url: str, locked_ref: str = None, ref: str = None) -> LockedRepoContext:
+        return prepare_locked_repo(repo_url, locked_ref or ref)
 
     def analyze(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
         api_path = self._normalize_api_path(api_path)
@@ -154,6 +116,14 @@ class JavaCallChainAnalyzer:
             ref=self.ref
         )
         result['api_path'] = api_path
+        if self.locked_repo_context:
+            metadata = result.setdefault('metadata', {})
+            metadata.update({
+                'repo_url': self.locked_repo_context.repo_url,
+                'locked_ref': self.locked_repo_context.locked_ref,
+                'resolved_commit': self.locked_repo_context.resolved_commit,
+                'fetched_missing_commit': self.locked_repo_context.fetched_missing_commit
+            })
         if trace_data:
             result['trace_data'] = trace_data
         return result

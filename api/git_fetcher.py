@@ -14,6 +14,8 @@ import ssl
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 
+from api.analyzer.repository_context import MutableRefNotAllowedError, normalize_locked_ref
+
 
 class GitFetcher:
     """
@@ -21,15 +23,15 @@ class GitFetcher:
     支持 git archive 协议和 GitHub/GitLab raw API
     """
 
-    def __init__(self, repo_url: str, ref: str = "HEAD"):
+    def __init__(self, repo_url: str, ref: str):
         """
         初始化 GitFetcher
 
         :param repo_url: Git 仓库 URL (如 https://github.com/user/repo.git)
-        :param ref: 分支或 commit hash，默认 HEAD
+        :param ref: 固定 commit SHA
         """
         self.repo_url = repo_url
-        self.ref = ref
+        self.ref = normalize_locked_ref(ref)
         self.verify_ssl = os.getenv("GIT_FETCHER_VERIFY_SSL", "true").lower() != "false"
         self._cache: Dict[str, bytes] = {}  # path -> content
         self._list_cache: Dict[str, List[str]] = {}  # dir -> files
@@ -112,7 +114,7 @@ class GitFetcher:
 
     def _fetch_file(self, file_path: str, ref: str = None) -> Optional[bytes]:
         """实际获取文件"""
-        target_ref = ref or self.ref
+        target_ref = normalize_locked_ref(ref or self.ref)
 
         # 尝试 git archive 方式
         content = self._fetch_via_git_archive(file_path, target_ref)
@@ -178,7 +180,8 @@ class GitFetcher:
         repo = repo.rstrip('.git')
 
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
-        params = f"?ref={ref}" if ref != "HEAD" else ""
+        params = f"?ref={ref}"
+
 
         headers = {
             'Accept': 'application/vnd.github.v3.raw',
@@ -231,7 +234,7 @@ class GitFetcher:
 
     def _list_directory(self, directory: str, ref: str = None) -> List[str]:
         """列出目录内容"""
-        target_ref = ref or self.ref
+        target_ref = normalize_locked_ref(ref or self.ref)
 
         if self._repo_type == 'github':
             return self._list_github_directory(directory, target_ref)
@@ -250,8 +253,7 @@ class GitFetcher:
         repo = repo.rstrip('.git')
 
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{directory}"
-        if ref != "HEAD":
-            api_url += f"?ref={ref}"
+        api_url += f"?ref={ref}"
 
         headers = {'User-Agent': 'GitFetcher/1.0'}
 
@@ -297,24 +299,22 @@ class GitRepoManager:
         self._fetchers: Dict[str, GitFetcher] = {}
         self._default_refs: Dict[str, str] = {}  # repo_url -> default ref
 
-    def get_fetcher(self, repo_url: str, ref: str = None) -> GitFetcher:
+    def get_fetcher(self, repo_url: str, ref: str) -> GitFetcher:
         """
         获取仓库的 fetcher，自动缓存
 
         :param repo_url: 仓库 URL
-        :param ref: 默认分支
+        :param ref: 固定 commit SHA
         """
-        if repo_url not in self._fetchers:
-            self._fetchers[repo_url] = GitFetcher(repo_url, ref or 'main')
-        elif ref and self._fetchers[repo_url].ref != ref:
-            # ref 变了，创建新的 fetcher
-            self._fetchers[repo_url] = GitFetcher(repo_url, ref)
-
-        return self._fetchers[repo_url]
+        locked_ref = normalize_locked_ref(ref)
+        cache_key = f"{repo_url}@{locked_ref}"
+        if cache_key not in self._fetchers:
+            self._fetchers[cache_key] = GitFetcher(repo_url, locked_ref)
+        return self._fetchers[cache_key]
 
     def set_default_ref(self, repo_url: str, ref: str):
-        """设置仓库默认分支"""
-        self._default_refs[repo_url] = ref
+        """设置仓库默认固定 commit SHA"""
+        self._default_refs[repo_url] = normalize_locked_ref(ref)
 
     def clear_cache(self, repo_url: str = None):
         """清除缓存"""
@@ -329,7 +329,7 @@ class GitRepoManager:
 _git_manager = GitRepoManager()
 
 
-def get_git_fetcher(repo_url: str, ref: str = None) -> GitFetcher:
+def get_git_fetcher(repo_url: str, ref: str) -> GitFetcher:
     """获取 GitFetcher 全局实例"""
     return _git_manager.get_fetcher(repo_url, ref)
 

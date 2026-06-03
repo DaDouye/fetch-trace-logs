@@ -87,7 +87,7 @@
               :min="0"
               preset="pair"
               key-placeholder="仓库URL"
-              value-placeholder="分支，默认master"
+              value-placeholder="commit SHA"
             />
           </n-form-item>
         </n-gi>
@@ -238,7 +238,7 @@ function handleAnalyze() {
     if (validRepos.length > 0) {
       params.repo_urls = validRepos.map(r => ({
         repo_url: r.key.trim(),
-        ref: r.value?.trim() || 'master'
+        locked_ref: r.value?.trim()
       }))
     }
 
