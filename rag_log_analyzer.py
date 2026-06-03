@@ -7,7 +7,7 @@
 import os
 import json
 import re
-import git
+from api.analyzer.repository_context import resolve_local_code_dir
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -19,53 +19,28 @@ import pickle
 from pathlib import Path
 import logging
 from config_manager import get_git_repo_url, load_config
-from api.analyzer.repository_context import LockedRepoContext, prepare_locked_repo
 
 
 class GitLogRAG:
-    def __init__(self, repo_path=None, repo_key=None, log_file_path=None, model_name="sentence-transformers/all-MiniLM-L6-v2", locked_ref=None, ref=None):
+    def __init__(self, repo_path=None, repo_key=None, log_file_path=None, model_name="sentence-transformers/all-MiniLM-L6-v2"):
         """
         初始化 RAG 系统
 
         Args:
-            repo_path (str): Git 仓库路径
-            repo_key (str): 配置文件中的仓库键名，用于从配置文件获取仓库路径
+            repo_path (str): 本地代码目录
+            repo_key (str): 配置文件中的代码目录键名
             log_file_path (str): 日志文件路径
             model_name (str): 嵌入模型名称
         """
-        # 如果提供了repo_key，则从配置文件中获取仓库路径
-        if repo_key:
-            repo_url = get_git_repo_url(repo_key)
-            if repo_url:
-                self.locked_repo_context = self._clone_or_get_local_repo(repo_url, locked_ref or ref)
-                self.repo_path = self.locked_repo_context.local_path
-            else:
-                raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
-        elif repo_path:
-            self.repo_path = repo_path
-        else:
-            raise ValueError("必须提供 repo_path 或 repo_key 参数")
+        self.local_code_context = resolve_local_code_dir(repo_path=repo_path, repo_key=repo_key)
+        self.repo_path = self.local_code_context.local_path
 
         self.log_file_path = log_file_path
         self.model_name = model_name
-        self.repo = git.Repo(self.repo_path)
         self.embeddings = HuggingFaceEmbeddings(model_name=model_name)
         self.vector_store = None
         self.qa_chain = None
         self.setup_logging()
-
-    def _clone_or_get_local_repo(self, repo_url, locked_ref) -> LockedRepoContext:
-        """
-        准备锁定到固定 commit 的本地仓库。
-
-        Args:
-            repo_url (str): 远程仓库URL
-            locked_ref (str): 固定 commit SHA
-
-        Returns:
-            LockedRepoContext: 锁定版本仓库上下文
-        """
-        return prepare_locked_repo(repo_url, locked_ref)
 
     def setup_logging(self):
         """设置日志记录"""
@@ -76,20 +51,19 @@ class GitLogRAG:
         """加载代码库内容"""
         self.logger.info("Loading codebase...")
         code_content = []
+        allowed_exts = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.html', '.css', '.json', '.yaml', '.yml', '.md', '.txt'}
 
-        for file_path in self.repo.tree().traverse():
-            if file_path.type == 'blob':  # 文件类型
-                try:
-                    # 只处理文本文件（忽略二进制文件）
-                    file_ext = Path(file_path.path).suffix.lower()
-                    if file_ext in ['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.html', '.css', '.json', '.yaml', '.yml', '.md', '.txt']:
-                        content = file_path.data_stream.read().decode('utf-8', errors='ignore')
-
-                        # 添加文件路径和内容作为文档
-                        doc_content = f"File: {file_path.path}\n\n{content}"
-                        code_content.append(doc_content)
-                except Exception as e:
-                    self.logger.warning(f"Could not read file {file_path.path}: {e}")
+        for file_path in Path(self.repo_path).rglob('*'):
+            if not file_path.is_file() or file_path.suffix.lower() not in allowed_exts:
+                continue
+            if '.git' in file_path.parts or 'node_modules' in file_path.parts:
+                continue
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                rel_path = file_path.relative_to(self.repo_path)
+                code_content.append(f"File: {rel_path}\n\n{content}")
+            except Exception as e:
+                self.logger.warning(f"Could not read file {file_path}: {e}")
 
         self.logger.info(f"Loaded {len(code_content)} files from codebase")
         return code_content

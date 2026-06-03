@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Repository version locking utilities for code analysis."""
+"""Local code directory context utilities for code analysis."""
 
-import hashlib
 import os
-import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
-
-import git
+from urllib.parse import urlparse
 
 
 class RepositoryContextError(ValueError):
@@ -16,135 +14,138 @@ class RepositoryContextError(ValueError):
         self.details = details or {}
 
 
-class MissingLockedRefError(RepositoryContextError):
+class LocalCodeDirNotFoundError(RepositoryContextError):
     pass
 
 
-class MutableRefNotAllowedError(RepositoryContextError):
+class LocalCodeDirNotDirectoryError(RepositoryContextError):
     pass
 
 
-class LockedRefNotFoundError(RepositoryContextError):
-    pass
-
-
-class RepoCheckoutMismatchError(RepositoryContextError):
+class LocalCodeDirNotReadableError(RepositoryContextError):
     pass
 
 
 @dataclass
-class LockedRepoContext:
-    repo_url: str
-    locked_ref: str
-    resolved_commit: str
+class LocalCodeDirContext:
     local_path: str
-    fetched_missing_commit: bool = False
+    source: str
+    requested_value: str
+    is_git_repo: bool
+    head_commit: Optional[str] = None
 
 
-_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+def resolve_local_code_dir(
+    repo_path: Optional[str] = None,
+    repo_key: Optional[str] = None,
+    repo_url: Optional[str] = None
+) -> LocalCodeDirContext:
+    if repo_path:
+        return _context_from_path(repo_path, "repo_path", repo_path)
 
-
-def normalize_locked_ref(locked_ref: Optional[str] = None, ref: Optional[str] = None) -> str:
-    candidate = (locked_ref or ref or "").strip()
-    if not candidate:
-        raise MissingLockedRefError("缺少固定代码版本，请提供 locked_ref commit SHA。")
-    if not _SHA_PATTERN.match(candidate):
-        raise MutableRefNotAllowedError(
-            "代码分析必须使用固定 commit SHA，不允许使用分支名、tag 或 HEAD。",
-            {"requested_ref": candidate}
-        )
-    return candidate.lower()
-
-
-def prepare_locked_repo(
-    repo_url: str,
-    locked_ref: str,
-    allow_fetch_missing: bool = False,
-    repos_root: str = "./repos"
-) -> LockedRepoContext:
-    target_ref = normalize_locked_ref(locked_ref)
-    repo_name = repo_url.split('/')[-1].replace('.git', '')
-    repo_hash = hashlib.sha1(repo_url.encode('utf-8')).hexdigest()[:8]
-    local_path = os.path.join(repos_root, f"{repo_name}-{target_ref}-{repo_hash}")
-    fetched_missing_commit = False
-
-    if os.path.exists(local_path):
-        repo = git.Repo(local_path)
-        resolved_commit = _resolve_local_commit(repo, target_ref)
-        if not resolved_commit:
-            if not allow_fetch_missing:
-                raise LockedRefNotFoundError(
-                    "本地仓库缓存缺少目标 locked_ref，且未允许补充获取。",
-                    {"repo_url": repo_url, "locked_ref": target_ref, "local_path": local_path}
-                )
-            _fetch_locked_ref(repo, target_ref)
-            fetched_missing_commit = True
-            resolved_commit = _resolve_local_commit(repo, target_ref)
-            if not resolved_commit:
-                raise LockedRefNotFoundError(
-                    "补充获取后仍无法找到目标 locked_ref。",
-                    {"repo_url": repo_url, "locked_ref": target_ref, "local_path": local_path}
-                )
-    else:
-        os.makedirs(local_path, exist_ok=True)
-        repo = git.Repo.init(local_path)
-        repo.create_remote('origin', repo_url)
-        _fetch_locked_ref(repo, target_ref, allow_ref_discovery=True)
-        fetched_missing_commit = True
-        resolved_commit = _resolve_local_commit(repo, target_ref)
-        if not resolved_commit:
-            raise LockedRefNotFoundError(
-                "无法获取目标 locked_ref。",
-                {"repo_url": repo_url, "locked_ref": target_ref, "local_path": local_path}
+    if repo_key:
+        from config_manager import get_git_repo_url
+        configured = get_git_repo_url(repo_key)
+        if not configured:
+            raise LocalCodeDirNotFoundError(
+                f"在配置中找不到键名为 '{repo_key}' 的代码目录配置。",
+                {"repo_key": repo_key, "source": "repo_key"}
             )
+        return _context_from_value(configured, "repo_key", repo_key)
 
-    repo.git.checkout(resolved_commit)
-    actual_head = repo.head.commit.hexsha
-    if actual_head != resolved_commit:
-        raise RepoCheckoutMismatchError(
-            "仓库 checkout 后的 HEAD 与 locked_ref 不一致。",
-            {
-                "repo_url": repo_url,
-                "locked_ref": target_ref,
-                "resolved_commit": resolved_commit,
-                "actual_head": actual_head,
-                "local_path": local_path
-            }
-        )
+    if repo_url:
+        return _context_from_value(repo_url, "repo_url", repo_url)
 
-    return LockedRepoContext(
-        repo_url=repo_url,
-        locked_ref=target_ref,
-        resolved_commit=resolved_commit,
-        local_path=local_path,
-        fetched_missing_commit=fetched_missing_commit
+    raise LocalCodeDirNotFoundError(
+        "必须提供 repo_path、repo_key 或 repo_url 参数。",
+        {"source": "none"}
     )
 
 
-def _resolve_local_commit(repo: git.Repo, locked_ref: str) -> Optional[str]:
+def build_code_dir_metadata(context: Optional[LocalCodeDirContext]) -> dict:
+    if not context:
+        return {}
+    return {
+        "local_path": context.local_path,
+        "source": context.source,
+        "requested_value": context.requested_value,
+        "is_git_repo": context.is_git_repo,
+        "head_commit": context.head_commit
+    }
+
+
+def _context_from_value(value: str, source: str, requested_value: str) -> LocalCodeDirContext:
+    if _is_repo_url(value):
+        repo_name = _repo_name_from_url(value)
+        return _context_from_path(os.path.join("./repos", repo_name), source, requested_value)
+    return _context_from_path(value, source, requested_value)
+
+
+def _context_from_path(path_value: str, source: str, requested_value: str) -> LocalCodeDirContext:
+    path = Path(path_value).expanduser().resolve()
+    if not path.exists():
+        raise LocalCodeDirNotFoundError(
+            "本地代码目录不存在，请先由人工准备该目录。",
+            {"local_path": str(path), "source": source, "requested_value": requested_value}
+        )
+    if not path.is_dir():
+        raise LocalCodeDirNotDirectoryError(
+            "本地代码路径不是目录。",
+            {"local_path": str(path), "source": source, "requested_value": requested_value}
+        )
+    if not os.access(path, os.R_OK):
+        raise LocalCodeDirNotReadableError(
+            "本地代码目录不可读。",
+            {"local_path": str(path), "source": source, "requested_value": requested_value}
+        )
+
+    head_commit = _read_git_head(path)
+    return LocalCodeDirContext(
+        local_path=str(path),
+        source=source,
+        requested_value=requested_value,
+        is_git_repo=head_commit is not None,
+        head_commit=head_commit
+    )
+
+
+def _read_git_head(path: Path) -> Optional[str]:
     try:
-        commit = repo.commit(locked_ref)
+        git_dir = path / ".git"
+        if not git_dir.exists():
+            return None
+        head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="ignore").strip()
+        if head.startswith("ref:"):
+            ref_path = git_dir / head.split(" ", 1)[1].strip()
+            if ref_path.exists():
+                return ref_path.read_text(encoding="utf-8", errors="ignore").strip() or None
+            packed_refs = git_dir / "packed-refs"
+            if packed_refs.exists():
+                ref_name = head.split(" ", 1)[1].strip()
+                for line in packed_refs.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line and not line.startswith("#") and line.endswith(f" {ref_name}"):
+                        return line.split(" ", 1)[0]
+            return None
+        return head or None
     except Exception:
         return None
-    if _FULL_SHA_PATTERN.match(locked_ref) and commit.hexsha != locked_ref:
-        return None
-    if not commit.hexsha.startswith(locked_ref):
-        return None
-    return commit.hexsha
 
 
-def _fetch_locked_ref(repo: git.Repo, locked_ref: str, allow_ref_discovery: bool = False) -> None:
-    try:
-        repo.remotes.origin.fetch(locked_ref)
-    except Exception as exc:
-        if allow_ref_discovery:
-            try:
-                repo.remotes.origin.fetch()
-                return
-            except Exception:
-                pass
-        raise LockedRefNotFoundError(
-            "无法从远端获取目标 locked_ref。",
-            {"locked_ref": locked_ref, "error": str(exc)}
-        ) from exc
+def _is_repo_url(value: str) -> bool:
+    text = (value or "").strip()
+    return (
+        text.startswith("http://")
+        or text.startswith("https://")
+        or text.startswith("git@")
+        or text.startswith("ssh://")
+    )
+
+
+def _repo_name_from_url(value: str) -> str:
+    text = value.strip()
+    if text.startswith("git@"):
+        name = text.rsplit("/", 1)[-1]
+    else:
+        parsed = urlparse(text)
+        name = parsed.path.rsplit("/", 1)[-1]
+    return name[:-4] if name.endswith(".git") else name

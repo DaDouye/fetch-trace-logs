@@ -61,17 +61,16 @@ def get_git_repo_url(key):
 
 def get_all_git_repos():
     """
-    获取所有Git仓库配置
+    获取所有代码目录/仓库配置
 
     Returns:
-        dict: 所有以Git URL形式存储的配置项
+        dict: 所有可能作为代码目录配置的项目
     """
     config = load_config()
-    git_repos = {}
+    repos = {}
 
-    # 假设所有包含".git"的值都是Git仓库URL
     for key, value in config.items():
-        if value.endswith('.git'):
-            git_repos[key] = value
+        if value.endswith('.git') or os.path.isdir(os.path.expanduser(value)):
+            repos[key] = value
 
-    return git_repos
+    return repos

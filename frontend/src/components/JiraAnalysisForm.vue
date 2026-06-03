@@ -86,8 +86,8 @@
               v-model:value="formValue.repoUrls"
               :min="0"
               preset="pair"
-              key-placeholder="仓库URL"
-              value-placeholder="commit SHA"
+              key-placeholder="本地代码目录或仓库URL"
+              value-placeholder="可留空"
             />
           </n-form-item>
         </n-gi>
@@ -234,11 +234,10 @@ function handleAnalyze() {
     }
 
     // 处理多仓库
-    const validRepos = formValue.value.repoUrls.filter(r => isRepoUrl(r.key))
+    const validRepos = formValue.value.repoUrls.filter(r => r.key?.trim())
     if (validRepos.length > 0) {
       params.repo_urls = validRepos.map(r => ({
-        repo_url: r.key.trim(),
-        locked_ref: r.value?.trim()
+        repo_url: r.key.trim()
       }))
     }
 
@@ -250,16 +249,5 @@ function handleAnalyze() {
 
     store.analyzeJiraIssue(params)
   })
-}
-
-function isRepoUrl(value) {
-  if (!value) return false
-  const text = value.trim()
-  return (
-    text.startsWith('http://') ||
-    text.startsWith('https://') ||
-    text.startsWith('git@') ||
-    text.startsWith('ssh://')
-  )
 }
 </script>

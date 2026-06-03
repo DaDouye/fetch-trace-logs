@@ -46,18 +46,16 @@ class AnalyzeRequest(BaseModel):
     api_path: Optional[str] = None  # 如 "/v1/customerAction/saveOrUpdateCustomer"，可由 Trace ID 自动识别
     repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_url 二选一)
     repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库)
-    ref: Optional[str] = None               # 兼容字段：仅当为 commit SHA 时可作为 locked_ref
-    locked_ref: Optional[str] = None        # 固定代码分析版本 commit SHA
+    repo_path: Optional[str] = None   # 本地代码目录（可选，与 repo_key/repo_url 三选一）
     trace_id: Optional[str] = None   # 可选，用于获取运行时数据
     date: Optional[str] = None       # 可选，如 "2026-04-23"
     cookies: Optional[str] = None     # 可选，trace API 认证 cookies
 
 
 class RepoInfo(BaseModel):
-    """单个仓库信息"""
-    repo_url: str
-    ref: Optional[str] = None
-    locked_ref: Optional[str] = None
+    """单个代码目录信息"""
+    repo_path: Optional[str] = None
+    repo_url: Optional[str] = None
 
 
 class AnalyzeJiraRequest(BaseModel):
@@ -65,8 +63,7 @@ class AnalyzeJiraRequest(BaseModel):
     jira_url: str                    # JIRA URL (必填)
     repo_key: Optional[str] = None   # 仓库键名 (可选，与 repo_urls 二选一)
     repo_url: Optional[str] = None    # Git 仓库 URL (可选，直接指定远程仓库) - 兼容旧版
-    ref: Optional[str] = None               # 兼容字段：仅当为 commit SHA 时可作为 locked_ref
-    locked_ref: Optional[str] = None        # 固定代码分析版本 commit SHA
+    repo_path: Optional[str] = None   # 本地代码目录（可选，与 repo_key/repo_url 三选一）
     repo_urls: Optional[List[RepoInfo]] = None  # Git 仓库 URL 列表 (支持多仓库)
     api_paths: Optional[List[str]] = None  # API 路径列表 (可选)
     trace_id: Optional[str] = None    # Trace ID (可选)
@@ -124,10 +121,12 @@ async def analyze_api(req: AnalyzeRequest):
     - cookies: (可选) Trace API 认证 cookies
     """
     try:
-        if req.repo_url:
-            analyzer = JavaCallChainAnalyzer(repo_url=req.repo_url, ref=req.ref, locked_ref=req.locked_ref)
+        if req.repo_path:
+            analyzer = JavaCallChainAnalyzer(repo_path=req.repo_path)
+        elif req.repo_url:
+            analyzer = JavaCallChainAnalyzer(repo_url=req.repo_url)
         elif req.repo_key:
-            analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key, ref=req.ref, locked_ref=req.locked_ref)
+            analyzer = JavaCallChainAnalyzer(repo_key=req.repo_key)
         else:
             raise HTTPException(
                 status_code=400,
@@ -195,19 +194,21 @@ async def analyze_jira(req: AnalyzeJiraRequest):
         from api.analyzer.jira_analyzer import JiraAnalyzer
 
         # 如果提供了 api_paths 但没有任何仓库，返回错误
-        if req.api_paths and not req.repo_key and not req.repo_url and not req.repo_urls:
+        if req.api_paths and not req.repo_key and not req.repo_url and not req.repo_urls and not req.repo_path:
             raise HTTPException(
                 status_code=400,
-                detail="repo_key or repo_url or repo_urls is required when api_paths is provided"
+                detail="repo_path or repo_key or repo_url or repo_urls is required when api_paths is provided"
             )
 
         # 支持多仓库
         if req.repo_urls:
-            analyzer = JiraAnalyzer(repo_urls=req.repo_urls, ref=req.ref, locked_ref=req.locked_ref)
+            analyzer = JiraAnalyzer(repo_urls=req.repo_urls)
+        elif req.repo_path:
+            analyzer = JiraAnalyzer(repo_path=req.repo_path)
         elif req.repo_url:
-            analyzer = JiraAnalyzer(repo_url=req.repo_url, ref=req.ref, locked_ref=req.locked_ref)
+            analyzer = JiraAnalyzer(repo_url=req.repo_url)
         else:
-            analyzer = JiraAnalyzer(repo_key=req.repo_key, ref=req.ref, locked_ref=req.locked_ref)
+            analyzer = JiraAnalyzer(repo_key=req.repo_key)
         result = analyzer.analyze(
             jira_url=req.jira_url,
             api_paths=req.api_paths,

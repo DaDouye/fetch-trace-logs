@@ -16,7 +16,7 @@ from pathlib import Path
 
 from api.git_fetcher import get_git_fetcher, GitFetcher
 from api.analyzer.claude_code_service import ClaudeCodeAnalysisService
-from api.analyzer.repository_context import LockedRepoContext, prepare_locked_repo
+from api.analyzer.repository_context import LocalCodeDirContext, build_code_dir_metadata, resolve_local_code_dir
 
 
 @dataclass
@@ -49,43 +49,25 @@ class JavaCallChainAnalyzer:
         self,
         repo_path: str = None,
         repo_key: str = None,
-        repo_url: str = None,
-        ref: str = None,
-        locked_ref: str = None
+        repo_url: str = None
     ):
         """
         初始化分析器
 
-        :param repo_path: 本地仓库路径（优先使用）
-        :param repo_key: 仓库键名（从 config 获取 URL）
-        :param repo_url: 远程仓库 URL（直接指定）
-        :param ref: 兼容字段；仅当它是 commit SHA 时可作为 locked_ref
-        :param locked_ref: 固定 commit SHA
+        :param repo_path: 本地代码目录（优先使用）
+        :param repo_key: 配置中的代码目录键名
+        :param repo_url: 兼容字段；URL 会映射到 ./repos/<repo_name>，本地路径会直接使用
         """
         self._git_fetcher: Optional[GitFetcher] = None
         self._use_remote = False
         self.repo_url = repo_url
-        self.ref = locked_ref or ref
-        self.locked_repo_context: Optional[LockedRepoContext] = None
-
-        if repo_path:
-            self.repo_path = repo_path
-            self._use_remote = False
-        elif repo_key:
-            from config_manager import get_git_repo_url
-            url = get_git_repo_url(repo_key)
-            if not url:
-                raise ValueError(f"在配置中找不到键名为 '{repo_key}' 的Git仓库地址")
-            self.repo_url = url
-            self.locked_repo_context = self._prepare_locked_repo(url, locked_ref, ref)
-            self.repo_path = self.locked_repo_context.local_path
-            self._use_remote = False
-        elif repo_url:
-            self.locked_repo_context = self._prepare_locked_repo(repo_url, locked_ref, ref)
-            self.repo_path = self.locked_repo_context.local_path
-            self._use_remote = False
-        else:
-            raise ValueError("必须提供 repo_path、repo_key 或 repo_url 参数")
+        self.ref = None
+        self.local_code_context: Optional[LocalCodeDirContext] = resolve_local_code_dir(
+            repo_path=repo_path,
+            repo_key=repo_key,
+            repo_url=repo_url
+        )
+        self.repo_path = self.local_code_context.local_path
 
         self.web_src_path = os.path.join(self.repo_path, 'web/src/main/java')
         self.config_path = os.path.join(self.repo_path, 'web/config')
@@ -94,10 +76,6 @@ class JavaCallChainAnalyzer:
         self._controller_cache: Dict[str, Tuple[str, str, int]] = {}
         self._service_impl_cache: Dict[str, str] = {}
         self._mapper_sql_cache: Dict[str, Dict[str, str]] = {}
-
-    @staticmethod
-    def _prepare_locked_repo(repo_url: str, locked_ref: str = None, ref: str = None) -> LockedRepoContext:
-        return prepare_locked_repo(repo_url, locked_ref or ref)
 
     def analyze(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
         api_path = self._normalize_api_path(api_path)
@@ -116,14 +94,8 @@ class JavaCallChainAnalyzer:
             ref=self.ref
         )
         result['api_path'] = api_path
-        if self.locked_repo_context:
-            metadata = result.setdefault('metadata', {})
-            metadata.update({
-                'repo_url': self.locked_repo_context.repo_url,
-                'locked_ref': self.locked_repo_context.locked_ref,
-                'resolved_commit': self.locked_repo_context.resolved_commit,
-                'fetched_missing_commit': self.locked_repo_context.fetched_missing_commit
-            })
+        if self.local_code_context:
+            result.setdefault('metadata', {}).update(build_code_dir_metadata(self.local_code_context))
         if trace_data:
             result['trace_data'] = trace_data
         return result
