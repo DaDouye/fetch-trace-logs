@@ -59,6 +59,27 @@ def get_git_repo_url(key):
     return config.get(key)
 
 
+def get_default_code_dir():
+    """
+    获取默认本地代码目录配置
+
+    Returns:
+        str: 默认本地代码目录或仓库配置，找不到则返回None
+    """
+    config = load_config()
+
+    for key in ("DEFAULT_CODE_DIR", "DEFAULT_REPO_PATH", "DEFAULT_REPO", "default_code_dir", "default_repo_path", "default_repo"):
+        value = config.get(key)
+        if value:
+            return value
+
+    repos = get_all_git_repos()
+    if len(repos) == 1:
+        return next(iter(repos.values()))
+
+    return None
+
+
 def get_all_git_repos():
     """
     获取所有代码目录/仓库配置

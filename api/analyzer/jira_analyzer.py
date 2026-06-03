@@ -49,15 +49,16 @@ class JiraAnalyzer:
         self.repo_urls = repo_urls
         self.local_code_context: Optional[LocalCodeDirContext] = None
 
-        if repo_path or repo_url or repo_key:
+        if repo_urls and not (repo_path or repo_url or repo_key):
+            self.repo_path = None
+        else:
             self.local_code_context = resolve_local_code_dir(
                 repo_path=repo_path,
                 repo_key=repo_key,
-                repo_url=repo_url
+                repo_url=repo_url,
+                use_default=not (repo_path or repo_url or repo_key)
             )
             self.repo_path = self.local_code_context.local_path
-        else:
-            self.repo_path = None
 
         self.multi_repo_paths = []
         if self.repo_urls:

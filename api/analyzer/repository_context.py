@@ -38,7 +38,8 @@ class LocalCodeDirContext:
 def resolve_local_code_dir(
     repo_path: Optional[str] = None,
     repo_key: Optional[str] = None,
-    repo_url: Optional[str] = None
+    repo_url: Optional[str] = None,
+    use_default: bool = False
 ) -> LocalCodeDirContext:
     if repo_path:
         return _context_from_path(repo_path, "repo_path", repo_path)
@@ -55,6 +56,16 @@ def resolve_local_code_dir(
 
     if repo_url:
         return _context_from_value(repo_url, "repo_url", repo_url)
+
+    if use_default:
+        from config_manager import get_default_code_dir
+        default_code_dir = get_default_code_dir()
+        if default_code_dir:
+            return _context_from_value(default_code_dir, "default_code_dir", default_code_dir)
+        raise LocalCodeDirNotFoundError(
+            "未配置默认本地代码目录，请在 .config 中配置 DEFAULT_CODE_DIR。",
+            {"source": "default_code_dir"}
+        )
 
     raise LocalCodeDirNotFoundError(
         "必须提供 repo_path、repo_key 或 repo_url 参数。",

@@ -193,13 +193,6 @@ async def analyze_jira(req: AnalyzeJiraRequest):
     try:
         from api.analyzer.jira_analyzer import JiraAnalyzer
 
-        # 如果提供了 api_paths 但没有任何仓库，返回错误
-        if req.api_paths and not req.repo_key and not req.repo_url and not req.repo_urls and not req.repo_path:
-            raise HTTPException(
-                status_code=400,
-                detail="repo_path or repo_key or repo_url or repo_urls is required when api_paths is provided"
-            )
-
         # 支持多仓库
         if req.repo_urls:
             analyzer = JiraAnalyzer(repo_urls=req.repo_urls)
@@ -223,10 +216,6 @@ async def analyze_jira(req: AnalyzeJiraRequest):
             extra_clues=req.extra_clues
         )
         result["request_context"] = {
-            "environment": req.environment,
-            "time_window": req.time_window,
-            "problem_type": req.problem_type,
-            "services": req.services or [],
             "extra_clues": req.extra_clues,
             "trace_id": result.get("trace_id") or req.trace_id,
             "trace_id_source": result.get("trace_id_source", "manual" if req.trace_id else "none"),
