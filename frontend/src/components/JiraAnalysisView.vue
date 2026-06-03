@@ -1,38 +1,32 @@
 <template>
   <div class="jira-analysis-view">
     <n-spin :show="loading">
-      <template v-if="jiraResult">
-        <n-card title="故障初筛卡片" embedded class="section-card">
+      <template v-if="displayResult">
+        <n-card :title="isSampleResult ? '故障初筛卡片（样例）' : '故障初筛卡片'" embedded class="section-card">
           <div class="card-header">
             <div>
-              <n-tag type="info">{{ jiraResult.jira?.key || jiraResult.issue_key }}</n-tag>
-              <h2>{{ jiraResult.jira?.summary || '暂无摘要' }}</h2>
+              <n-space align="center">
+                <n-tag type="info">{{ displayResult.jira?.key || displayResult.issue_key }}</n-tag>
+                <n-tag v-if="isSampleResult" type="success">样例</n-tag>
+              </n-space>
+              <h2>{{ displayResult.jira?.summary || '暂无摘要' }}</h2>
             </div>
-            <n-space>
-              <n-tag>{{ requestContext.environment || '未填写环境' }}</n-tag>
-              <n-tag type="warning">{{ requestContext.problem_type || '未填写类型' }}</n-tag>
-            </n-space>
           </div>
 
           <n-divider />
 
           <section class="card-section">
-            <h3>排查范围</h3>
+            <h3>问题线索</h3>
             <n-descriptions label-placement="top" :column="3">
-              <n-descriptions-item label="时间窗口">
-                {{ timeWindowText }}
-              </n-descriptions-item>
-              <n-descriptions-item label="服务范围">
-                <n-space v-if="requestContext.services?.length">
-                  <n-tag v-for="service in requestContext.services" :key="service" size="small">
-                    {{ service }}
-                  </n-tag>
-                </n-space>
-                <span v-else>未填写</span>
-              </n-descriptions-item>
               <n-descriptions-item label="Trace">
                 <div>{{ displayTraceId }}</div>
                 <div v-if="traceIdHint" class="muted-text">{{ traceIdHint }}</div>
+              </n-descriptions-item>
+              <n-descriptions-item label="代码目录">
+                {{ codeDirText }}
+              </n-descriptions-item>
+              <n-descriptions-item label="补充线索">
+                {{ requestContext.extra_clues || '未填写' }}
               </n-descriptions-item>
             </n-descriptions>
           </section>
@@ -214,9 +208,81 @@ import { useAnalyzerStore } from '../stores/analyzer'
 
 const store = useAnalyzerStore()
 
+const sampleJiraResult = {
+  issue_key: 'DEMO-123',
+  jira: {
+    key: 'DEMO-123',
+    summary: '订单提交后页面提示支付状态异常',
+    created: '2026-06-03T09:30:00+08:00',
+    updated: '2026-06-03T10:12:00+08:00'
+  },
+  request_context: {
+    extra_clues: '用户反馈订单已扣款，但页面仍显示待支付',
+    trace_id: 'demo-trace-8f3a2c1b',
+    trace_id_source: 'jira',
+    trace_id_note: '从 Jira 描述中识别到 Trace ID',
+    trace_date: '2026-06-03'
+  },
+  code_context: {
+    local_path: '/workspace/order-service',
+    files: [
+      { file_path: 'src/main/java/com/example/order/OrderController.java' },
+      { file_path: 'src/main/java/com/example/order/PaymentCallbackService.java' }
+    ],
+    call_chains: [{ entry: 'POST /api/orders/{id}/pay/callback' }],
+    trace_data: {
+      success: true,
+      trace_id: 'demo-trace-8f3a2c1b',
+      evidence_summary: 'Trace 显示支付回调已进入订单服务，但订单状态更新分支未命中成功状态。',
+      services: ['order-service', 'payment-service'],
+      has_error: true,
+      error_nodes: [
+        { service_name: 'order-service', operation_name: 'PaymentCallbackService.updateOrderStatus' }
+      ],
+      slowest_node: {
+        service_name: 'order-service',
+        operation_name: 'PaymentCallbackService.updateOrderStatus',
+        duration_ms: 426
+      },
+      has_sql: true,
+      sql_count: 1,
+      sql: [
+        {
+          service_name: 'order-service',
+          duration_ms: 38,
+          rid: 'SQL-1',
+          sql: "update order_record set pay_status = 'PAID' where order_id = ? and pay_status = 'WAIT_PAY'"
+        }
+      ]
+    }
+  },
+  analysis: {
+    possible_causes: [
+      {
+        category: '支付回调状态映射异常',
+        analysis: '支付平台返回成功状态后，订单服务的状态映射逻辑可能没有覆盖当前回调值，导致订单仍停留在待支付。',
+        suggestion: '优先检查 PaymentCallbackService 中回调状态到订单状态的映射分支。',
+        evidence_files: [
+          { file_path: 'src/main/java/com/example/order/PaymentCallbackService.java' }
+        ]
+      },
+      {
+        category: '幂等更新条件未命中',
+        analysis: 'SQL 更新条件要求订单仍为 WAIT_PAY，如果订单状态已被其它流程改写，回调更新会失败。',
+        suggestion: '核对订单状态变更历史，并确认回调更新失败时是否有告警。',
+        evidence_files: [
+          { file_path: 'src/main/java/com/example/order/OrderRepository.java' }
+        ]
+      }
+    ]
+  }
+}
+
 const loading = computed(() => store.loading)
 const jiraResult = computed(() => store.jiraResult)
-const requestContext = computed(() => jiraResult.value?.request_context || store.lastJiraRequest || {})
+const displayResult = computed(() => jiraResult.value || sampleJiraResult)
+const isSampleResult = computed(() => !jiraResult.value)
+const requestContext = computed(() => displayResult.value?.request_context || store.lastJiraRequest || {})
 const savedFeedback = computed(() => store.feedback)
 
 const feedbackForm = reactive({
@@ -233,10 +299,10 @@ const yesNoOptions = [
 ]
 
 const topCauses = computed(() =>
-  (jiraResult.value?.analysis?.possible_causes || []).slice(0, 3)
+  (displayResult.value?.analysis?.possible_causes || []).slice(0, 3)
 )
 
-const traceSummary = computed(() => jiraResult.value?.code_context?.trace_data || null)
+const traceSummary = computed(() => displayResult.value?.code_context?.trace_data || null)
 
 const traceSqlList = computed(() => traceSummary.value?.sql || [])
 
@@ -252,9 +318,9 @@ const traceIdHint = computed(() => {
 })
 
 const evidenceCount = computed(() => {
-  const files = jiraResult.value?.code_context?.files?.length || 0
-  const chains = jiraResult.value?.code_context?.call_chains?.length || 0
-  const trace = jiraResult.value?.code_context?.trace_data ? 1 : 0
+  const files = displayResult.value?.code_context?.files?.length || 0
+  const chains = displayResult.value?.code_context?.call_chains?.length || 0
+  const trace = displayResult.value?.code_context?.trace_data ? 1 : 0
   return files + chains + trace
 })
 
@@ -268,6 +334,12 @@ const serviceText = computed(() => {
   const services = traceSummary.value?.services || []
   return services.length ? services.join('、') : '未识别到服务'
 })
+
+const codeDirText = computed(() =>
+  displayResult.value?.code_context?.local_path
+  || displayResult.value?.metadata?.local_path
+  || '使用系统默认代码目录'
+)
 
 const slowestNodeText = computed(() => {
   const node = traceSummary.value?.slowest_node
@@ -292,18 +364,11 @@ const traceFailureReason = computed(() =>
   traceSummary.value?.failure_reason || traceSummary.value?.error || 'Trace 获取失败'
 )
 
-const timeWindowText = computed(() => {
-  const window = requestContext.value.time_window
-  if (!window?.start && !window?.end) return '未填写'
-  return `${window.start || '未填写'} 至 ${window.end || '未填写'}`
-})
-
 const timelineItems = computed(() => {
-  const jira = jiraResult.value?.jira || {}
+  const jira = displayResult.value?.jira || {}
   const items = [
     { label: '问题创建', value: formatDate(jira.created) || 'Jira 未返回创建时间' },
-    { label: '排查窗口开始', value: requestContext.value.time_window?.start || '未填写' },
-    { label: '排查窗口结束', value: requestContext.value.time_window?.end || '未填写' }
+    { label: 'Trace 日期', value: requestContext.value.trace_date || '未填写' }
   ]
 
   if (jira.updated) {
@@ -322,8 +387,8 @@ const nextActions = computed(() => {
   if (suggestions.length) return suggestions
 
   return [
-    '补充该时间窗口内的错误日志或 Trace ID',
-    '确认服务范围是否覆盖真实请求链路',
+    '补充 Trace ID 或日志平台链接，增强链路证据',
+    '确认 Jira 描述中的接口名、错误关键词和用户现象是否完整',
     '对比问题发生前后的发布记录和关键指标变化'
   ]
 })
@@ -332,8 +397,8 @@ const informationGaps = computed(() => {
   const gaps = []
   if (!requestContext.value.trace_id) gaps.push('缺少 Trace ID，链路证据可能不完整')
   if (!requestContext.value.extra_clues) gaps.push('缺少接口名或错误关键词，原因判断会偏粗')
-  if (!jiraResult.value?.code_context?.trace_data) gaps.push('缺少链路追踪摘要')
-  if (!jiraResult.value?.code_context?.files?.length) gaps.push('缺少相关证据文件或匹配线索')
+  if (!displayResult.value?.code_context?.trace_data) gaps.push('缺少链路追踪摘要')
+  if (!displayResult.value?.code_context?.files?.length) gaps.push('缺少相关证据文件或匹配线索')
   return gaps.length ? gaps : ['当前信息较完整，可由人工继续确认根因']
 })
 
