@@ -353,11 +353,7 @@ class JiraAnalyzer:
 
         # 2. Build code context
         result['code_context'] = self._build_code_context(
-<<<<<<< HEAD
-            issue_key, api_paths, trace_id, trace_date, cookies, explicit_code_context
-=======
             issue_key, api_paths, trace_resolution['trace_id'], trace_date, cookies
->>>>>>> d8d9c4c9a34affcf688366274d3123c8db924a39
         )
 
         # 3. Perform cause analysis
