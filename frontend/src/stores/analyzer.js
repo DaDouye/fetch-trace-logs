@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { fetchRepos, analyzeApi, analyzeJira } from '../api'
+import { fetchRepos, analyzeApi, analyzeJira, saveAnalysisFeedback } from '../api'
 
 export const useAnalyzerStore = defineStore('analyzer', () => {
   const repos = ref([])
@@ -52,10 +52,27 @@ export const useAnalyzerStore = defineStore('analyzer', () => {
     }
   }
 
-  function saveFeedback(payload) {
-    feedback.value = {
-      ...payload,
-      saved_at: new Date().toLocaleString()
+  async function saveFeedback(payload) {
+    const request = {
+      issue_key: jiraResult.value?.jira?.key || jiraResult.value?.issue_key,
+      jira_url: jiraResult.value?.jira_url || lastJiraRequest.value?.jira_url,
+      predicted_causes: (jiraResult.value?.analysis?.possible_causes || []).slice(0, 3),
+      ...payload
+    }
+
+    try {
+      const res = await saveAnalysisFeedback(request)
+      feedback.value = {
+        ...request,
+        saved_at: res.data.saved_at
+      }
+    } catch (e) {
+      error.value = e.response?.data?.detail || e.message || '保存反馈失败'
+      feedback.value = {
+        ...request,
+        saved_at: new Date().toLocaleString(),
+        local_only: true
+      }
     }
   }
 

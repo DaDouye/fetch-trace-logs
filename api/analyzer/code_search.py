@@ -16,6 +16,11 @@ class CodeSearch:
 
     # Search scope: only Java files under web/src/main/java
     SEARCH_SCOPE_PATTERN = re.compile(r'web/src/main/java[/\\].*\.java$')
+    LOW_VALUE_KEYWORDS = {
+        'com', 'org', 'java', 'javax', 'souche', 'danube', 'jiaxuan',
+        'supermario', 'model', 'domain', 'dto', 'vo', 'entity', 'utils',
+        'common', 'business', 'starter'
+    }
 
     def __init__(self, repo_path: str):
         """
@@ -56,7 +61,7 @@ class CodeSearch:
         if business_terms:
             keywords.extend(business_terms)
 
-        keywords = [k for k in dict.fromkeys(keywords) if k]
+        keywords = [k for k in dict.fromkeys(keywords) if self._is_searchable_keyword(k)]
         if not keywords or not os.path.exists(self.repo_path):
             return results
 
@@ -69,13 +74,23 @@ class CodeSearch:
                 if result_count_by_keyword[keyword] >= max_results_per_keyword:
                     continue
 
+                meaningful_matches = [
+                    match for match in matches
+                    if match.get('match_quality') != 'import_only'
+                ]
+                if not meaningful_matches:
+                    continue
+
                 result_count_by_keyword[keyword] += 1
                 if file_path not in seen_files:
                     seen_files.add(file_path)
+                    quality = self._classify_file_quality(file_path, meaningful_matches)
                     results.append({
                         'file_path': file_path,
                         'keyword': keyword,
-                        'matches': matches[:5]
+                        'matches': meaningful_matches[:5],
+                        'match_quality': quality,
+                        'evidence_score': self._calculate_evidence_score(file_path, keyword, meaningful_matches, quality)
                     })
 
             if all(count >= max_results_per_keyword for count in result_count_by_keyword.values()):
@@ -108,13 +123,64 @@ class CodeSearch:
             lower_line = line.lower()
             for keyword, lowered_keyword in keywords:
                 if lowered_keyword in lower_line:
+                    match_quality = self._classify_line_match(line)
                     matches_by_keyword.setdefault(keyword, []).append({
                         'line_number': line_num,
                         'content': line.strip(),
-                        'context': self._get_context_from_lines(lines, line_num)
+                        'context': self._get_context_from_lines(lines, line_num),
+                        'match_quality': match_quality
                     })
 
         return matches_by_keyword
+
+    @classmethod
+    def _is_searchable_keyword(cls, keyword: str) -> bool:
+        text = str(keyword or '').strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if lowered in cls.LOW_VALUE_KEYWORDS:
+            return False
+        if len(lowered) < 4 and not text.startswith('/'):
+            return False
+        return True
+
+    @staticmethod
+    def _classify_line_match(line: str) -> str:
+        stripped = line.strip()
+        if stripped.startswith('import '):
+            return 'import_only'
+        if stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*'):
+            return 'comment'
+        if any(marker in stripped for marker in ('@Rest', '@RequestMapping', '@GetMapping', '@PostMapping')):
+            return 'api_mapping'
+        if any(marker in stripped for marker in ('throw ', 'catch ', 'log.', 'return ', 'if ', 'if(')):
+            return 'logic'
+        return 'text'
+
+    @staticmethod
+    def _classify_file_quality(file_path: str, matches: List[Dict[str, Any]]) -> str:
+        normalized_path = file_path.replace('\\', '/').lower()
+        if any(match.get('match_quality') in {'api_mapping', 'logic'} for match in matches):
+            return 'strong'
+        if re.search(r'/(dto|vo|entity|model)/|(?:dto|vo|entity)\.java$', normalized_path):
+            return 'weak'
+        if all(match.get('match_quality') == 'comment' for match in matches):
+            return 'weak'
+        return 'medium'
+
+    @staticmethod
+    def _calculate_evidence_score(file_path: str, keyword: str, matches: List[Dict[str, Any]], quality: str) -> int:
+        score_by_quality = {
+            'strong': 8,
+            'medium': 4,
+            'weak': 1
+        }
+        score = score_by_quality.get(quality, 1)
+        score += min(len(matches), 3)
+        if str(keyword or '').startswith('/'):
+            score += 6
+        return score
 
     def _get_context_from_lines(self, lines: List[str], line_num: int, context_lines: int = 2) -> List[Dict]:
         context = []

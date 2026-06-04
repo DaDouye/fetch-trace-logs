@@ -70,6 +70,7 @@ class AIAnalyzer:
         issue_key = jira_content.get('key', '')
         issue_type = jira_content.get('issue_type', '')
         priority = jira_content.get('priority', '')
+        comments = jira_content.get('comments') or []
 
         # Build code context info
         code_files = code_context.get('files', [])
@@ -86,6 +87,12 @@ class AIAnalyzer:
 - 描述: {description or '无'}
 - 线上问题描述: {custom_field or '无'}
 """
+
+        if comments:
+            prompt += "\n## Jira 评论摘要\n"
+            for comment in comments[-5:]:
+                body = str(comment.get('body') or '').replace('\r', ' ').replace('\n', ' ')
+                prompt += f"- {comment.get('author', 'Unknown')} {comment.get('created', '')}: {body[:300]}\n"
 
         # Add RAG context if available
         if rag_context:

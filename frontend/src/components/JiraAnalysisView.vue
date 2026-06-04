@@ -17,6 +17,35 @@
           <n-divider />
 
           <section class="card-section">
+            <h3>可能原因 Top 3</h3>
+            <template v-if="topCauses.length">
+              <n-list>
+                <n-list-item v-for="(cause, index) in topCauses" :key="index">
+                  <div class="cause-block">
+                    <div class="cause-title">
+                      <n-tag type="warning" size="small">Top {{ index + 1 }}</n-tag>
+                      <strong>{{ cause.category || '待判断原因' }}</strong>
+                    </div>
+                    <p v-if="cause.analysis">{{ cause.analysis }}</p>
+                    <p v-if="cause.suggestion" class="muted-text">{{ cause.suggestion }}</p>
+                    <template v-if="cause.evidence_files?.length">
+                      <div class="evidence-box">
+                        <span>证据</span>
+                        <n-ul>
+                          <n-li v-for="file in cause.evidence_files.slice(0, 3)" :key="file.file_path">
+                            {{ getEvidenceTitle(file.file_path) }}
+                          </n-li>
+                        </n-ul>
+                      </div>
+                    </template>
+                  </div>
+                </n-list-item>
+              </n-list>
+            </template>
+            <n-empty v-else description="暂未形成明确原因，请补充更多上下文" />
+          </section>
+
+          <section class="card-section">
             <h3>排查范围</h3>
             <n-descriptions label-placement="top" :column="3">
               <n-descriptions-item label="时间窗口">
@@ -63,6 +92,58 @@
               </n-list-item>
             </n-list>
           </section>
+
+          <!--
+          <section class="card-section">
+            <h3>测试备注结论</h3>
+            <template v-if="commentInsights?.has_comments">
+              <div class="trace-grid">
+                <div class="signal-item">
+                  <span>根因分类</span>
+                  <strong>{{ commentInsights.root_cause_category || '未识别' }}</strong>
+                </div>
+                <div class="signal-item">
+                  <span>处理动作</span>
+                  <strong>{{ commentInsights.resolution_action || '未明确' }}</strong>
+                </div>
+                <div class="signal-item">
+                  <span>是否真实缺陷</span>
+                  <strong>{{ realBugText }}</strong>
+                </div>
+                <div class="signal-item">
+                  <span>备注数量</span>
+                  <strong>{{ commentInsights.comment_count || 0 }} 条</strong>
+                </div>
+              </div>
+              <div class="evidence-box comment-box">
+                <span>最后备注</span>
+                <p>{{ commentInsights.final_comment || '暂无' }}</p>
+              </div>
+            </template>
+            <n-empty v-else description="该 Jira 暂无测试备注" />
+          </section>
+
+          <section class="card-section">
+            <h3>相似历史问题</h3>
+            <template v-if="historicalCases.length">
+              <n-list>
+                <n-list-item v-for="item in historicalCases" :key="item.issue_key">
+                  <n-thing :title="`${item.issue_key} ${item.summary}`">
+                    <template #description>
+                      <n-space size="small">
+                        <n-tag size="small">{{ item.status }}</n-tag>
+                        <n-tag size="small" type="info">{{ item.root_cause_category }}</n-tag>
+                        <n-tag size="small" type="success">{{ item.resolution_action }}</n-tag>
+                      </n-space>
+                      <p class="muted-text">{{ item.final_comment || '暂无最终备注' }}</p>
+                    </template>
+                  </n-thing>
+                </n-list-item>
+              </n-list>
+            </template>
+            <n-empty v-else description="未命中相似历史问题" />
+          </section>
+          -->
 
           <section class="card-section">
             <h3>链路日志分析</h3>
@@ -111,35 +192,6 @@
               </template>
             </template>
             <n-empty v-else description="未提供 Trace ID，暂无链路日志分析" />
-          </section>
-
-          <section class="card-section">
-            <h3>可能原因 Top 3</h3>
-            <template v-if="topCauses.length">
-              <n-list>
-                <n-list-item v-for="(cause, index) in topCauses" :key="index">
-                  <div class="cause-block">
-                    <div class="cause-title">
-                      <n-tag type="warning" size="small">Top {{ index + 1 }}</n-tag>
-                      <strong>{{ cause.category || '待判断原因' }}</strong>
-                    </div>
-                    <p v-if="cause.analysis">{{ cause.analysis }}</p>
-                    <p v-if="cause.suggestion" class="muted-text">{{ cause.suggestion }}</p>
-                    <template v-if="cause.evidence_files?.length">
-                      <div class="evidence-box">
-                        <span>证据</span>
-                        <n-ul>
-                          <n-li v-for="file in cause.evidence_files.slice(0, 3)" :key="file.file_path">
-                            {{ getEvidenceTitle(file.file_path) }}
-                          </n-li>
-                        </n-ul>
-                      </div>
-                    </template>
-                  </div>
-                </n-list-item>
-              </n-list>
-            </template>
-            <n-empty v-else description="暂未形成明确原因，请补充更多上下文" />
           </section>
 
           <section class="card-section">
@@ -235,6 +287,21 @@ const yesNoOptions = [
 const topCauses = computed(() =>
   (jiraResult.value?.analysis?.possible_causes || []).slice(0, 3)
 )
+
+const commentInsights = computed(() =>
+  jiraResult.value?.analysis?.comment_insights || jiraResult.value?.jira?.comment_insights || null
+)
+
+const historicalCases = computed(() =>
+  jiraResult.value?.analysis?.historical_cases || jiraResult.value?.historical_cases || []
+)
+
+const realBugText = computed(() => {
+  const value = commentInsights.value?.is_real_bug
+  if (value === true) return '是'
+  if (value === false) return '否'
+  return '未明确'
+})
 
 const traceSummary = computed(() => jiraResult.value?.code_context?.trace_data || null)
 
@@ -332,6 +399,7 @@ const informationGaps = computed(() => {
   const gaps = []
   if (!requestContext.value.trace_id) gaps.push('缺少 Trace ID，链路证据可能不完整')
   if (!requestContext.value.extra_clues) gaps.push('缺少接口名或错误关键词，原因判断会偏粗')
+  if (!commentInsights.value?.has_comments) gaps.push('缺少测试备注结论，无法直接复用人工排查经验')
   if (!jiraResult.value?.code_context?.trace_data) gaps.push('缺少链路追踪摘要')
   if (!jiraResult.value?.code_context?.files?.length) gaps.push('缺少相关证据文件或匹配线索')
   return gaps.length ? gaps : ['当前信息较完整，可由人工继续确认根因']
@@ -580,6 +648,16 @@ function saveFeedback() {
 .evidence-box span {
   font-size: 12px;
   color: #667085;
+}
+
+.comment-box {
+  margin-top: 12px;
+}
+
+.comment-box p {
+  margin: 8px 0 0;
+  line-height: 1.6;
+  white-space: pre-wrap;
 }
 
 @media (max-width: 768px) {

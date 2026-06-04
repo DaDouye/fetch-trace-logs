@@ -19,3 +19,7 @@ export function analyzeApi(params) {
 export function analyzeJira(params) {
   return http.post('/analyze-jira', params)
 }
+
+export function saveAnalysisFeedback(params) {
+  return http.post('/analysis-feedback', params)
+}

@@ -17,6 +17,7 @@ load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from api.jira_client import JiraClient
+# from api.analyzer.comment_insights import CommentInsightExtractor, HistoricalIssueIndex
 from api.analyzer.rule_engine import RuleEngine
 from api.analyzer.code_search import CodeSearch
 from api.analyzer.ai_analyzer import AIAnalyzer
@@ -81,6 +82,8 @@ class JiraAnalyzer:
 
         self.jira_client = JiraClient()
         self.rule_engine = RuleEngine()
+        # self.comment_insight_extractor = CommentInsightExtractor()
+        # self.historical_issue_index = HistoricalIssueIndex()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
         # For multi-repo mode, we don't use single code_search but search each repo separately
         self._ai_analyzer = None
@@ -345,6 +348,14 @@ class JiraAnalyzer:
 
         # 1. Fetch JIRA content
         result['jira'] = self._fetch_jira_content(issue_key)
+        # comment_insights = self.comment_insight_extractor.extract(result['jira'])
+        # result['jira']['comment_insights'] = comment_insights
+        # result['historical_cases'] = self.historical_issue_index.search(
+        #     result['jira'],
+        #     comment_insights,
+        #     limit=5
+        # )
+        # result['jira']['historical_cases'] = result['historical_cases']
         trace_resolution = self._resolve_trace_id(trace_id, result['jira'])
         result['trace_id'] = trace_resolution['trace_id']
         result['trace_id_source'] = trace_resolution['source']
@@ -353,7 +364,12 @@ class JiraAnalyzer:
 
         # 2. Build code context
         result['code_context'] = self._build_code_context(
-            issue_key, api_paths, trace_resolution['trace_id'], trace_date, cookies
+            issue_key,
+            api_paths,
+            trace_resolution['trace_id'],
+            trace_date,
+            cookies,
+            enable_code_context=explicit_code_context
         )
 
         # 3. Perform cause analysis
@@ -1059,7 +1075,8 @@ class JiraAnalyzer:
         method_like_terms = re.findall(r'\b[a-z][A-Za-z0-9_]{3,}\b', text)
         ignored = {
             'true', 'false', 'null', 'error', 'exception', 'failed', 'failure',
-            'http', 'server', 'client', 'unknown'
+            'http', 'server', 'client', 'unknown', 'com', 'souche', 'danube',
+            'java', 'javax', 'starter', 'business', 'model', 'domain'
         }
         for term in method_like_terms:
             if term.lower() not in ignored:
@@ -1445,6 +1462,8 @@ class JiraAnalyzer:
         jira = result.get('jira', {})
         code_context = result.get('code_context', {})
         trace_data = result.get('code_context', {}).get('trace_data')
+        # comment_insights = jira.get('comment_insights') or {}
+        # historical_cases = result.get('historical_cases') or []
 
         # Combine all text for analysis
         text_to_analyze = self._combine_text_for_analysis(jira, code_context)
@@ -1452,6 +1471,10 @@ class JiraAnalyzer:
         # Rule-based analysis (always run)
         rule_causes = self.rule_engine.analyze(text_to_analyze)
         causes.extend(rule_causes)
+
+        # comment_cause = self._build_comment_insight_cause(comment_insights, historical_cases)
+        # if comment_cause:
+        #     causes.insert(0, comment_cause)
 
         # Add code context evidence if available
         if code_context.get('files'):
@@ -1525,6 +1548,43 @@ class JiraAnalyzer:
         return {
             'possible_causes': causes,
             'ai_enhanced': ai_enhanced
+            # 'comment_insights': comment_insights,
+            # 'historical_cases': historical_cases
+        }
+
+    def _build_comment_insight_cause(
+        self,
+        comment_insights: Dict[str, Any],
+        historical_cases: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Promote tester comments and historical issue conclusions into a first-class cause."""
+        if not comment_insights.get('has_comments') and not historical_cases:
+            return None
+
+        category = comment_insights.get('root_cause_category') or '测试备注结论'
+        resolution = comment_insights.get('resolution_action') or '未明确'
+        final_comment = comment_insights.get('final_comment') or '当前 Jira 暂无测试备注结论'
+        real_bug = comment_insights.get('is_real_bug')
+        bug_text = '是' if real_bug is True else '否' if real_bug is False else '未明确'
+        similar_text = ''
+        if historical_cases:
+            top = historical_cases[0]
+            similar_text = (
+                f" 相似历史问题 {top.get('issue_key')}「{top.get('summary')}」"
+                f" 的结论为：{top.get('root_cause_category')} / {top.get('resolution_action')}。"
+            )
+
+        return {
+            'id': 'comment_insight',
+            'category': category,
+            'analysis': (
+                f"测试备注识别到的处理结论：{resolution}；是否真实缺陷：{bug_text}。"
+                f"末条备注：{final_comment[:240]}。{similar_text}"
+            ),
+            'suggestion': '优先核对测试备注中的最终结论、数据订正或第三方/权限说明，再决定是否继续做代码排查。',
+            'confidence': 0.88 if comment_insights.get('has_comments') else 0.62,
+            'comment_insights': comment_insights,
+            'historical_cases': historical_cases[:3]
         }
 
     def _combine_text_for_analysis(self, jira: Dict, code_context: Dict) -> str:
@@ -1634,9 +1694,14 @@ class JiraAnalyzer:
             analysis_parts.append(f"日志错误片段：{log_error_text[:180]}。")
         if evidence_files:
             top = evidence_files[0]
-            analysis_parts.append(
-                f"代码搜索命中 {top.get('file_path')}，关键词为 {top.get('keyword')}，说明异常线索和代码路径存在交集。"
-            )
+            if top.get('match_quality') == 'weak':
+                analysis_parts.append(
+                    f"代码搜索基于关键词 {top.get('keyword')} 命中 {top.get('file_path')}，但该命中质量较弱，仅作为辅助线索。"
+                )
+            else:
+                analysis_parts.append(
+                    f"代码搜索命中 {top.get('file_path')}，关键词为 {top.get('keyword')}，可作为异常线索与代码路径的交叉证据。"
+                )
 
         if business_inference:
             suggestion_parts = business_inference['suggestions']
@@ -1695,9 +1760,14 @@ class JiraAnalyzer:
             analysis_parts.append(f"已根据服务/接口线索映射到代码入口 {controller_text}。")
         if files:
             top = evidence_files[0] if evidence_files else files[0]
-            analysis_parts.append(
-                f"代码搜索命中 {len(files)} 个相关文件，首要命中为 {top.get('file_path')}，关键词为 {top.get('keyword')}。"
-            )
+            if top.get('match_quality') == 'weak':
+                analysis_parts.append(
+                    f"代码搜索命中 {len(files)} 个文件，首要命中为 {top.get('file_path')}，但关键词 {top.get('keyword')} 的命中质量较弱。"
+                )
+            else:
+                analysis_parts.append(
+                    f"代码搜索命中 {len(files)} 个相关文件，首要命中为 {top.get('file_path')}，关键词为 {top.get('keyword')}。"
+                )
         if not analysis_parts:
             analysis_parts.append(f"已获取 JIRA「{jira.get('summary', '')}」对应的代码上下文。")
 
@@ -1812,12 +1882,14 @@ class JiraAnalyzer:
                 str(item.get('keyword') or ''),
                 ' '.join(match.get('content', '') for match in item.get('matches', []))
             ]).lower()
-            value = 0
+            value = item.get('evidence_score') or 0
             for term in priority_terms:
                 if term and term in text:
                     value += 10
             if item.get('source') == 'trace':
                 value += 3
+            if item.get('match_quality') == 'weak':
+                value -= 4
             return value
 
         return sorted(files, key=score, reverse=True)

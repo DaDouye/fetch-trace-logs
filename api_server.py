@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os
+import json
+from datetime import datetime
 from dotenv import load_dotenv
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -73,6 +75,17 @@ class AnalyzeJiraRequest(BaseModel):
     services: Optional[List[str]] = None
     time_window: Optional[Dict[str, Any]] = None
     extra_clues: Optional[str] = None
+
+
+class AnalysisFeedbackRequest(BaseModel):
+    """人工反馈请求模型"""
+    issue_key: Optional[str] = None
+    jira_url: Optional[str] = None
+    helpful: Optional[str] = None
+    hit_root_cause: Optional[str] = None
+    root_cause: Optional[str] = None
+    note: Optional[str] = None
+    predicted_causes: Optional[List[Dict[str, Any]]] = None
 
 
 @app.get("/")
@@ -224,6 +237,26 @@ async def analyze_jira(req: AnalyzeJiraRequest):
         raise HTTPException(status_code=404, detail=f"仓库不存在: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"JIRA 分析失败: {str(e)}")
+
+
+@app.post("/api/analysis-feedback")
+async def save_analysis_feedback(req: AnalysisFeedbackRequest):
+    """保存人工反馈，供后续评估和规则优化使用"""
+    try:
+        feedback_dir = os.getenv("ANALYSIS_FEEDBACK_DIR", "data")
+        os.makedirs(feedback_dir, exist_ok=True)
+        feedback_path = os.path.join(feedback_dir, "analysis_feedback.jsonl")
+        record = req.model_dump()
+        record["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(feedback_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return {
+            "success": True,
+            "saved_at": record["saved_at"],
+            "path": feedback_path
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存反馈失败: {str(e)}")
 
 
 @app.get("/api/health")
