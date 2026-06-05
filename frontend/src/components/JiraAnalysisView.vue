@@ -26,8 +26,16 @@
                       <n-tag type="warning" size="small">Top {{ index + 1 }}</n-tag>
                       <strong>{{ cause.category || '待判断原因' }}</strong>
                     </div>
-                    <p v-if="cause.analysis">{{ cause.analysis }}</p>
-                    <p v-if="cause.suggestion" class="muted-text">{{ cause.suggestion }}</p>
+                    <div v-if="cause.analysis" class="cause-lines">
+                      <p v-for="(line, lineIndex) in formatCauseText(cause.analysis)" :key="`analysis-${lineIndex}`">
+                        {{ line }}
+                      </p>
+                    </div>
+                    <ul v-if="getCauseSuggestionLines(cause).length" class="cause-suggestions muted-text">
+                      <li v-for="(line, lineIndex) in getCauseSuggestionLines(cause)" :key="`suggestion-${lineIndex}`">
+                        {{ line }}
+                      </li>
+                    </ul>
                     <template v-if="cause.evidence_files?.length">
                       <div class="evidence-box">
                         <span>证据</span>
@@ -86,11 +94,12 @@
 
           <section class="card-section">
             <h3>关键时间线</h3>
-            <n-list>
-              <n-list-item v-for="item in timelineItems" :key="item.label">
-                <n-thing :title="item.label" :description="item.value" />
-              </n-list-item>
-            </n-list>
+            <div class="timeline-row">
+              <span v-for="item in timelineItems" :key="item.label" class="timeline-item">
+                <strong>{{ item.label }}</strong>
+                <span>{{ item.value }}</span>
+              </span>
+            </div>
           </section>
 
           <section class="card-section">
@@ -358,6 +367,30 @@ function getEvidenceTitle(filePath) {
   return filePath.split('/').pop()
 }
 
+function formatCauseText(value) {
+  if (Array.isArray(value)) {
+    return value
+      .flatMap(item => formatCauseText(item))
+      .filter(Boolean)
+  }
+
+  return String(value || '')
+    .replace(/[；;。]/g, match => `${match}\n`)
+    .split('\n')
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+function getCauseSuggestionLines(cause) {
+  const checklist = cause?.comment_insights?.diagnosis_checklist || cause?.diagnosis_checklist || []
+  if (Array.isArray(checklist) && checklist.length) {
+    return checklist
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+  }
+  return formatCauseText(cause?.suggestion)
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -520,6 +553,31 @@ function saveFeedback() {
   font-weight: 600;
 }
 
+.timeline-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: center;
+  color: #475467;
+  line-height: 1.5;
+}
+
+.timeline-item {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  white-space: nowrap;
+}
+
+.timeline-item strong {
+  color: #344054;
+  font-weight: 600;
+}
+
+.timeline-item span {
+  color: #667085;
+}
+
 .signal-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -575,6 +633,30 @@ function saveFeedback() {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+.cause-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cause-lines p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.cause-suggestions {
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+  white-space: normal;
+}
+
+.cause-suggestions li {
+  display: list-item;
+  margin: 2px 0;
+  line-height: 1.6;
 }
 
 .muted-text {

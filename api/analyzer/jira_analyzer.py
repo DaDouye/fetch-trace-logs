@@ -1692,6 +1692,7 @@ class JiraAnalyzer:
                 f"最相似案例为 {top.get('issue_key')}「{top.get('summary')}」。"
             ),
             'suggestion': '；'.join(checklist[:3]) if checklist else '优先核对业务对象、数据状态、配置规则和第三方状态，再决定是否继续做代码排查。',
+            'diagnosis_checklist': checklist[:3],
             'confidence': 0.88 if comment_insights.get('has_comments') else 0.62,
             'comment_insights': comment_insights,
             'historical_cases': historical_cases[:3]
