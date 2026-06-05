@@ -120,6 +120,9 @@ class JavaCallChainAnalyzer:
         return self._merge_analyze_results(results)
 
     def _analyze_single(self, api_path: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
+        if self._is_dubbo_signature(api_path):
+            return self._analyze_dubbo_single(api_path, trace_id, date, cookies)
+
         if api_path.endswith('.json'):
             api_path = api_path[:-5]
         if api_path.endswith('/'):
@@ -150,6 +153,57 @@ class JavaCallChainAnalyzer:
         if trace_data:
             result['trace_data'] = trace_data
 
+        return result
+
+    def _analyze_dubbo_single(self, signature: str, trace_id: str = None, date: str = None, cookies: str = None) -> Dict[str, Any]:
+        parsed = self._parse_dubbo_signature(signature)
+        if not parsed:
+            return {'error': f'Dubbo 接口格式不正确: {signature}', 'api_path': signature}
+
+        interface_name = parsed['class_name']
+        method_name = parsed['method_name']
+        impl_path = self._find_dubbo_impl(interface_name)
+        if not impl_path:
+            return {
+                'error': f'找不到 Dubbo 实现类: {interface_name}',
+                'api_path': signature,
+                'interface': interface_name,
+                'method_name': method_name
+            }
+
+        impl_content = self._read_file(impl_path)
+        if not impl_content:
+            return {'error': f'无法读取 Dubbo 实现类: {impl_path}', 'api_path': signature}
+
+        impl_method = self._find_implementation_method(impl_content, method_name)
+        if not impl_method:
+            return {
+                'error': f'找不到 Dubbo 方法: {interface_name}.{method_name}',
+                'api_path': signature,
+                'interface': interface_name,
+                'implementation': impl_path
+            }
+
+        impl_class = os.path.basename(impl_path).replace('.java', '')
+        call_chain = self._build_dubbo_call_chain(interface_name, impl_class, method_name, impl_path, impl_method['line'])
+
+        trace_data = None
+        if trace_id:
+            trace_data = self._fetch_trace_data(trace_id, date, cookies)
+
+        ascii_graph = self._format_ascii(call_chain, signature)
+        result = {
+            'api_path': signature,
+            'method': 'DUBBO',
+            'controller': impl_class,
+            'controller_method': method_name,
+            'interface': interface_name,
+            'implementation': impl_path,
+            'call_chain': self._serialize_call_chain(call_chain),
+            'ascii_graph': ascii_graph
+        }
+        if trace_data:
+            result['trace_data'] = trace_data
         return result
 
     def _merge_analyze_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -184,6 +238,8 @@ class JavaCallChainAnalyzer:
 
     @staticmethod
     def _normalize_api_path(api_path: str) -> Union[str, List[str]]:
+        if JavaCallChainAnalyzer._is_dubbo_signature(api_path):
+            return (api_path or '').strip()
         try:
             from scripts.fetch_trace_souche import TraceFetcher
             result = TraceFetcher.normalize_api_path(api_path)
@@ -211,6 +267,23 @@ class JavaCallChainAnalyzer:
                     normalized_paths.append(candidate.strip())
 
         return list(dict.fromkeys(normalized_paths))
+
+    @staticmethod
+    def _is_dubbo_signature(value: str) -> bool:
+        text = (value or '').strip()
+        return bool(re.match(r'^(?:[A-Za-z_]\w*\.)+[A-Z]\w*\.[a-zA-Z_]\w*$', text))
+
+    @staticmethod
+    def _parse_dubbo_signature(signature: str) -> Optional[Dict[str, str]]:
+        text = (signature or '').strip()
+        if not JavaCallChainAnalyzer._is_dubbo_signature(text):
+            return None
+        class_path, method_name = text.rsplit('.', 1)
+        return {
+            'class_path': class_path,
+            'class_name': class_path.rsplit('.', 1)[-1],
+            'method_name': method_name
+        }
 
     def _read_file(self, file_path: str) -> Optional[str]:
         """读取文件内容，兼容本地和远程模式"""
@@ -396,6 +469,44 @@ class JavaCallChainAnalyzer:
         internal_calls = list(self._extract_this_method_calls(content, method_name, line_number))
         for internal in internal_calls:
             child_node = self._trace_this_call(file_path, internal['method'], internal['line'])
+            if child_node:
+                root.children.append(child_node)
+
+        return root
+
+    def _build_dubbo_call_chain(
+        self,
+        interface_name: str,
+        impl_class: str,
+        method_name: str,
+        impl_path: str,
+        line_number: int
+    ) -> CallChainNode:
+        content = self._read_file(impl_path)
+        root = CallChainNode(
+            layer='Dubbo',
+            class_name=impl_class,
+            method_name=method_name,
+            file_path=impl_path,
+            line_number=line_number,
+            annotation=f'implements {interface_name}',
+            is_entry=True
+        )
+        if not content:
+            return root
+
+        for call in self._extract_method_calls(content, method_name, line_number):
+            if any(x in call['class'] for x in ['DAO', 'Mapper', 'Manager']):
+                child_node = self._trace_dao_call(call['class'], call['method'], call['line'])
+            elif 'Service' in call['class'] or self._find_service_impl(call['class']):
+                child_node = self._trace_call(call['class'], call['method'], call['line'])
+            else:
+                child_node = None
+            if child_node:
+                root.children.append(child_node)
+
+        for internal in self._extract_this_method_calls(content, method_name, line_number):
+            child_node = self._trace_this_call(impl_path, internal['method'], internal['line'])
             if child_node:
                 root.children.append(child_node)
 
@@ -600,6 +711,59 @@ class JavaCallChainAnalyzer:
                             self._service_impl_cache[service_interface] = impl_path
                             return impl_path
 
+        return None
+
+    def _find_dubbo_impl(self, interface_name: str) -> Optional[str]:
+        """Find a Dubbo implementation by `implements InterfaceName` or naming convention."""
+        simple_name = interface_name.rsplit('.', 1)[-1]
+        cache_key = f'dubbo:{simple_name}'
+        if cache_key in self._service_impl_cache:
+            return self._service_impl_cache[cache_key]
+
+        impl_names = []
+        base_name = simple_name[1:] if simple_name.startswith('I') and len(simple_name) > 1 and simple_name[1].isupper() else simple_name
+        impl_names.extend([
+            f'{base_name}Impl.java',
+            f'{base_name}ServiceImpl.java',
+            f'{simple_name}Impl.java'
+        ])
+
+        if self._use_remote:
+            java_files = self._git_fetcher.list_files('web/src/main/java')
+            for file_path in java_files:
+                if not file_path.endswith('.java'):
+                    continue
+                if any(file_path.endswith(name) for name in impl_names):
+                    content = self._read_file(file_path) or ''
+                    if re.search(rf'\bimplements\s+[^{chr(123)};]*\b{re.escape(simple_name)}\b', content):
+                        self._service_impl_cache[cache_key] = file_path
+                        return file_path
+            for file_path in java_files:
+                if file_path.endswith(tuple(impl_names)):
+                    self._service_impl_cache[cache_key] = file_path
+                    return file_path
+            return None
+
+        if not self.repo_path or not os.path.exists(self.repo_path):
+            return None
+        for root, dirs, files in os.walk(self.web_src_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for file in files:
+                if not file.endswith('.java'):
+                    continue
+                file_path = os.path.join(root, file)
+                content = self._read_file(file_path) or ''
+                if re.search(rf'\bimplements\s+[^{chr(123)};]*\b{re.escape(simple_name)}\b', content):
+                    self._service_impl_cache[cache_key] = file_path
+                    return file_path
+
+        for root, dirs, files in os.walk(self.web_src_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for file in files:
+                if any(file.lower() == name.lower() for name in impl_names):
+                    file_path = os.path.join(root, file)
+                    self._service_impl_cache[cache_key] = file_path
+                    return file_path
         return None
 
     def _search_remote_file(self, directory: str, filename: str) -> Optional[str]:

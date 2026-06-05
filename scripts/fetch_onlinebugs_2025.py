@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Jira ONLINEBUG 2025 数据 ETL
-一次性拉取 2025 年全年 ONLINEBUG 项目数据，落库至 MySQL jira_online_issue_2025 表
+Jira ONLINEBUG 2026 上半年数据 ETL
+一次性拉取 2026-01-01 至 2026-06-30 的 ONLINEBUG 项目缺陷数据，
+落库至 MySQL jira_online_issue_2026_up 表。
 """
 import os
 import sys
@@ -40,7 +41,9 @@ MYSQL_USER = os.getenv('MYSQL_USER', 'souche_rw')
 MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', 'Ewm3prj6WRcwbv4x')
 MYSQL_DATABASE = os.getenv('MYSQL_DATABASE', 'super_mario')
 
-JQL = "project = ONLINEBUG AND issuetype = 缺陷 AND created >= 2025-01-01 AND created <= 2025-12-31"
+TARGET_TABLE = "jira_online_issue_2026_up"
+DATE_RANGE_LABEL = "2026 上半年"
+JQL = "project = ONLINEBUG AND issuetype = 缺陷 AND created >= 2026-01-01 AND created <= 2026-06-30"
 MAX_RESULTS_PER_PAGE = 50
 MAX_RETRIES = 3
 RETRY_DELAY = 1
@@ -60,8 +63,8 @@ def build_mysql_connection():
 
 def ensure_table_exists(conn):
     """建表语句（IF NOT EXISTS）"""
-    create_sql = """
-    CREATE TABLE IF NOT EXISTS jira_online_issue_2025 (
+    create_sql = f"""
+    CREATE TABLE IF NOT EXISTS {TARGET_TABLE} (
         id            VARCHAR(32)   PRIMARY KEY,
         project       VARCHAR(32),
         issue_num     INTEGER,
@@ -193,7 +196,7 @@ def extract_fields(issue_data):
         # 转换 Jira ISO 格式为 MySQL DATETIME 格式
         created_date = created_raw.replace('Z', '+00:00')
         if created_date:
-            created_date = created_date[:19]  # 2025-01-01T00:00:00+00:00 → 2025-01-01T00:00:00
+            created_date = created_date[:19]  # 2026-01-01T00:00:00+00:00 -> 2026-01-01T00:00:00
     except (ValueError, TypeError):
         created_date = None
 
@@ -224,8 +227,8 @@ def insert_issue(conn, issue_data, comments_list):
     """插入或更新单条 issue（含评论）"""
     comments_json = json.dumps(comments_list, ensure_ascii=False)
 
-    sql = """
-    INSERT INTO jira_online_issue_2025
+    sql = f"""
+    INSERT INTO {TARGET_TABLE}
         (id, project, issue_num, summary, status, assignee, reporter, created_date, online_desc, comments, fetched_at)
     VALUES
         (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
@@ -263,14 +266,14 @@ def main():
         print("Error: JIRA_USERNAME and JIRA_PASSWORD must be set in .config or environment variables.")
         sys.exit(1)
 
-    print(f"[{datetime.now().isoformat()}] 开始拉取 Jira ONLINEBUG 2025 数据")
+    print(f"[{datetime.now().isoformat()}] 开始拉取 Jira ONLINEBUG {DATE_RANGE_LABEL} 数据")
     print(f"JQL: {JQL}")
 
     # 1. 建表
     conn = build_mysql_connection()
     try:
         ensure_table_exists(conn)
-        print("目标表 jira_online_issue_2025 就绪")
+        print(f"目标表 {TARGET_TABLE} 就绪")
     finally:
         conn.close()
 
@@ -322,7 +325,7 @@ def main():
 
     print(f"\n[{datetime.now().isoformat()}] 完成")
     print(f"成功: {fetched_count}, 失败: {error_count}")
-    print(f"目标表 jira_online_issue_2025 数据已就绪")
+    print(f"目标表 {TARGET_TABLE} 数据已就绪")
 
 
 if __name__ == "__main__":

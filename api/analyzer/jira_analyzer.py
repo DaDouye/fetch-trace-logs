@@ -18,6 +18,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from api.jira_client import JiraClient
 # from api.analyzer.comment_insights import CommentInsightExtractor, HistoricalIssueIndex
+from api.analyzer.comment_insights import CommentInsightExtractor, HistoricalIssueIndex, ProblemDomainClassifier
 from api.analyzer.rule_engine import RuleEngine
 from api.analyzer.code_search import CodeSearch
 from api.analyzer.ai_analyzer import AIAnalyzer
@@ -82,8 +83,9 @@ class JiraAnalyzer:
 
         self.jira_client = JiraClient()
         self.rule_engine = RuleEngine()
-        # self.comment_insight_extractor = CommentInsightExtractor()
-        # self.historical_issue_index = HistoricalIssueIndex()
+        self.comment_insight_extractor = CommentInsightExtractor()
+        self.historical_issue_index = HistoricalIssueIndex()
+        self.problem_domain_classifier = ProblemDomainClassifier()
         self.code_search = CodeSearch(self.repo_path) if self.repo_path else None
         # For multi-repo mode, we don't use single code_search but search each repo separately
         self._ai_analyzer = None
@@ -348,14 +350,21 @@ class JiraAnalyzer:
 
         # 1. Fetch JIRA content
         result['jira'] = self._fetch_jira_content(issue_key)
-        # comment_insights = self.comment_insight_extractor.extract(result['jira'])
-        # result['jira']['comment_insights'] = comment_insights
-        # result['historical_cases'] = self.historical_issue_index.search(
-        #     result['jira'],
-        #     comment_insights,
-        #     limit=5
-        # )
-        # result['jira']['historical_cases'] = result['historical_cases']
+        comment_insights = self.comment_insight_extractor.extract(result['jira'])
+        problem_domain = self.problem_domain_classifier.classify(" ".join([
+            str(result['jira'].get('summary') or ''),
+            str(result['jira'].get('description') or ''),
+            str(result['jira'].get('customfield_19900') or ''),
+        ]))
+        comment_insights['problem_domain'] = problem_domain
+        comment_insights['diagnosis_checklist'] = self.problem_domain_classifier.checklist(problem_domain)
+        result['jira']['comment_insights'] = comment_insights
+        result['historical_cases'] = self.historical_issue_index.search(
+            result['jira'],
+            comment_insights,
+            limit=5
+        )
+        result['jira']['historical_cases'] = result['historical_cases']
         trace_resolution = self._resolve_trace_id(trace_id, result['jira'])
         result['trace_id'] = trace_resolution['trace_id']
         result['trace_id_source'] = trace_resolution['source']
@@ -523,23 +532,26 @@ class JiraAnalyzer:
         context['search_keywords'] = keywords
         print(f"[CodeContext] Keywords: {keywords}")
 
+        request_api_paths = self._normalize_api_paths(api_paths or [])
+        request_http_paths = [path for path in request_api_paths if not self._is_dubbo_signature(path)]
+        request_dubbo_signatures = [path for path in request_api_paths if self._is_dubbo_signature(path)]
+        dubbo_search_terms = self._extract_dubbo_search_terms(request_dubbo_signatures)
+
         # 使用 JIRA 中的 api_paths 进行代码搜索
-        search_api_paths = keywords.get('api_paths', [])
-        if not search_api_paths:
-            search_api_paths = []
+        search_api_paths = list(dict.fromkeys((keywords.get('api_paths', []) or []) + request_http_paths))
         searched_keywords = {
             'api_paths': set(search_api_paths),
-            'class_names': set(keywords.get('class_names', [])),
+            'class_names': set((keywords.get('class_names', []) or []) + dubbo_search_terms['class_names']),
             'error_patterns': set(keywords.get('error_patterns', [])),
-            'business_terms': set(keywords.get('business_terms', []))
+            'business_terms': set((keywords.get('business_terms', []) or []) + dubbo_search_terms['business_terms'])
         }
 
         if enable_code_context and has_repo_context:
             context['files'] = self._search_code(
                 api_paths=search_api_paths,
-                class_names=keywords.get('class_names', []),
+                class_names=list(searched_keywords['class_names']),
                 error_patterns=keywords.get('error_patterns', []),
-                business_terms=keywords.get('business_terms', []),
+                business_terms=list(searched_keywords['business_terms']),
                 source='jira'
             )
             print(f"[CodeContext] Search results: {len(context['files'])} files")
@@ -594,7 +606,7 @@ class JiraAnalyzer:
 
         # Perform call chain analysis for all paths at once
         # 优先使用用户提供的api_paths，其次是trace提取的
-        call_chain_paths = self._normalize_api_paths(api_paths if api_paths else trace_api_paths)
+        call_chain_paths = request_api_paths if request_api_paths else self._normalize_api_paths(trace_api_paths)
         print(f"[CodeContext] Call chain paths: {call_chain_paths}")
         if enable_code_context and call_chain_paths:
             call_chain_result = self._analyze_call_chain(call_chain_paths)
@@ -687,6 +699,9 @@ class JiraAnalyzer:
             from scripts.fetch_trace_souche import TraceFetcher
             normalized = []
             for path in flat:
+                if JiraAnalyzer._is_dubbo_signature(path):
+                    normalized.append(path.strip())
+                    continue
                 result = TraceFetcher.normalize_api_path(path)
                 if isinstance(result, list):
                     normalized.extend(result)
@@ -695,6 +710,29 @@ class JiraAnalyzer:
         except Exception:
             normalized = flat
         return [path for path in dict.fromkeys(normalized) if path]
+
+    @staticmethod
+    def _is_dubbo_signature(value: str) -> bool:
+        text = (value or '').strip()
+        return bool(re.match(r'^(?:[A-Za-z_]\w*\.)+[A-Z]\w*\.[a-zA-Z_]\w*$', text))
+
+    @staticmethod
+    def _extract_dubbo_search_terms(signatures: List[str]) -> Dict[str, List[str]]:
+        class_names = []
+        business_terms = []
+        for signature in signatures or []:
+            if not JiraAnalyzer._is_dubbo_signature(signature):
+                continue
+            class_path, method_name = signature.rsplit('.', 1)
+            class_name = class_path.rsplit('.', 1)[-1]
+            class_names.append(class_name)
+            business_terms.extend([signature, class_path, method_name])
+            if class_name.startswith('I') and len(class_name) > 1 and class_name[1].isupper():
+                business_terms.append(class_name[1:])
+        return {
+            'class_names': list(dict.fromkeys(class_names)),
+            'business_terms': list(dict.fromkeys(business_terms))
+        }
 
     def _fetch_trace_data(self, trace_id: str, date: str, cookies: str) -> Optional[Dict[str, Any]]:
         """Fetch trace data from Souche tracing system"""
@@ -851,14 +889,16 @@ class JiraAnalyzer:
         method_snippets = self._collect_call_chain_method_snippets(code_context.get('call_chains') or [])
         for snippet in method_snippets:
             hints = self._extract_business_hints_from_snippet(snippet)
-            if hints:
+            risk_hints = self._extract_code_risk_hints_from_snippet(snippet)
+            combined_hints = hints + risk_hints
+            if combined_hints:
                 evidence.append({
                     'type': 'code_method',
                     'file_path': snippet.get('file_path'),
                     'line_number': snippet.get('line_number'),
                     'class_name': snippet.get('class_name'),
                     'method_name': snippet.get('method_name'),
-                    'hints': hints
+                    'hints': combined_hints[:12]
                 })
 
         trace_data = code_context.get('trace_data') or {}
@@ -991,6 +1031,39 @@ class JiraAnalyzer:
                 'content': text[:260]
             })
             if len(hints) >= 8:
+                break
+
+        return hints
+
+    def _extract_code_risk_hints_from_snippet(self, snippet: Dict[str, Any]) -> List[Dict[str, Any]]:
+        body = snippet.get('body') or ''
+        if not body:
+            return []
+
+        risk_patterns = [
+            ('参数校验', r'ValidateUtil|validateStringParamNull|validate.*Param|参数验空|参数校验|required|not\s*null'),
+            ('权限校验', r'authCheck|NO_SUCH_PERMISSION|权限检查|权限校验'),
+            ('显式异常', r'\bthrow\s+new\b|DanubeBusinessException|OptimusException|BusinessException|ErrorCode'),
+            ('布局/字段校验', r'validateButtonLayout|ButtonValidateParam|FieldValue|fieldValueList|字段'),
+            ('重复校验', r'validateRepeat|重复校验'),
+            ('对象转换', r'EntityUtil\.mapping|CONVERSION_FAILED|转换'),
+            ('用户/组织校验', r'userService\.get|NO_USER|departmentId|shopCode|orgId|operator'),
+        ]
+
+        hints = []
+        for index, line in enumerate(body.splitlines(), 1):
+            text = line.strip()
+            if not text:
+                continue
+            for category, pattern in risk_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    hints.append({
+                        'line_offset': index,
+                        'content': text[:300],
+                        'category': category
+                    })
+                    break
+            if len(hints) >= 10:
                 break
 
         return hints
@@ -1462,19 +1535,21 @@ class JiraAnalyzer:
         jira = result.get('jira', {})
         code_context = result.get('code_context', {})
         trace_data = result.get('code_context', {}).get('trace_data')
-        # comment_insights = jira.get('comment_insights') or {}
-        # historical_cases = result.get('historical_cases') or []
+        comment_insights = jira.get('comment_insights') or {}
+        historical_cases = result.get('historical_cases') or []
 
         # Combine all text for analysis
         text_to_analyze = self._combine_text_for_analysis(jira, code_context)
 
         # Rule-based analysis (always run)
         rule_causes = self.rule_engine.analyze(text_to_analyze)
+        for cause in rule_causes:
+            cause['source'] = 'rule'
         causes.extend(rule_causes)
 
-        # comment_cause = self._build_comment_insight_cause(comment_insights, historical_cases)
-        # if comment_cause:
-        #     causes.insert(0, comment_cause)
+        comment_cause = self._build_comment_insight_cause(comment_insights, historical_cases)
+        if comment_cause:
+            causes.insert(0, comment_cause)
 
         # Add code context evidence if available
         if code_context.get('files'):
@@ -1501,35 +1576,14 @@ class JiraAnalyzer:
                 ai_causes = ai_result.get('possible_causes', [])
 
                 if ai_causes:
+                    for cause in ai_causes:
+                        cause['source'] = 'ai'
                     causes.extend(ai_causes)
                     ai_enhanced = True
                 else:
-                    # AI didn't return useful results, add a default analysis
-                    causes.append({
-                        'id': 'ai_analysis',
-                        'category': '问题分析',
-                        'analysis': f'根据JIRA问题「{jira.get("summary", "")}」的分析，'
-                                    f'问题可能涉及业务流程、状态管理或数据一致性问题。'
-                                    f'建议检查相关接口的入参、权限以及数据库状态。',
-                        'suggestion': '1. 检查接口调用参数是否完整\n2. 验证用户权限和状态\n3. 查看相关数据库记录\n4. 确认业务流程是否正确执行',
-                        'confidence': 0.7
-                    })
-                    ai_enhanced = True
+                    ai_enhanced = False
             except Exception as e:
-                # AI调用失败时添加默认分析
-                causes.append({
-                    'id': 'ai_analysis_error',
-                    'category': '问题分析',
-                    'analysis': f'系统分析完成，根据问题描述「{jira.get("summary", "")}」，'
-                                f'该问题可能涉及以下方面：\n'
-                                f'1. 业务流程执行异常\n'
-                                f'2. 数据状态不一致\n'
-                                f'3. 接口调用失败或超时\n'
-                                f'4. 权限或认证问题\n\n'
-                                f'AI分析服务暂时不可用，请人工排查。',
-                    'suggestion': '1. 检查相关接口的日志\n2. 验证数据状态\n3. 确认业务流程是否正常',
-                    'confidence': 0.5
-                })
+                print(f"[_analyze_causes] AI analysis unavailable: {e}")
 
         if os.getenv("RAG_AUTO_INDEX", "false").lower() == "true":
             try:
@@ -1546,42 +1600,98 @@ class JiraAnalyzer:
                 print(f"[_analyze_causes] RAG indexing error: {e}")
 
         return {
-            'possible_causes': causes,
-            'ai_enhanced': ai_enhanced
-            # 'comment_insights': comment_insights,
-            # 'historical_cases': historical_cases
+            'possible_causes': self._filter_actionable_causes(causes),
+            'ai_enhanced': ai_enhanced,
+            'comment_insights': comment_insights,
+            'historical_cases': historical_cases
         }
+
+    def _filter_actionable_causes(self, causes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove low-signal template/rule causes from the Top causes list."""
+        if not causes:
+            return []
+
+        has_code_or_trace_cause = any(
+            cause.get('id') in {'trace_code_path', 'code_context_path'}
+            for cause in causes
+        )
+        filtered = []
+        seen = set()
+
+        for cause in causes:
+            cause_id = cause.get('id') or ''
+            category = cause.get('category') or ''
+            analysis = cause.get('analysis') or ''
+            key = (cause_id, category, analysis[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if cause_id in {'ai_analysis', 'ai_analysis_error'}:
+                continue
+            if self._is_generic_template_cause(cause):
+                continue
+            if has_code_or_trace_cause and cause.get('source') == 'rule' and not cause.get('evidence_files'):
+                continue
+
+            filtered.append(cause)
+
+        return filtered
+
+    @staticmethod
+    def _is_generic_template_cause(cause: Dict[str, Any]) -> bool:
+        text = ' '.join([
+            str(cause.get('category') or ''),
+            str(cause.get('analysis') or ''),
+            str(cause.get('suggestion') or '')
+        ])
+        generic_phrases = (
+            '可能涉及业务流程',
+            '业务流程执行异常',
+            '数据状态不一致',
+            '接口调用失败或超时',
+            'AI分析服务暂时不可用',
+            '请查看AI分析结果'
+        )
+        return any(phrase in text for phrase in generic_phrases)
 
     def _build_comment_insight_cause(
         self,
         comment_insights: Dict[str, Any],
         historical_cases: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        """Promote tester comments and historical issue conclusions into a first-class cause."""
-        if not comment_insights.get('has_comments') and not historical_cases:
+        """Promote historical issue patterns into a first-class cause without exposing raw comments."""
+        if not historical_cases:
             return None
 
-        category = comment_insights.get('root_cause_category') or '测试备注结论'
-        resolution = comment_insights.get('resolution_action') or '未明确'
-        final_comment = comment_insights.get('final_comment') or '当前 Jira 暂无测试备注结论'
-        real_bug = comment_insights.get('is_real_bug')
-        bug_text = '是' if real_bug is True else '否' if real_bug is False else '未明确'
-        similar_text = ''
-        if historical_cases:
-            top = historical_cases[0]
-            similar_text = (
-                f" 相似历史问题 {top.get('issue_key')}「{top.get('summary')}」"
-                f" 的结论为：{top.get('root_cause_category')} / {top.get('resolution_action')}。"
-            )
+        problem_domain = comment_insights.get('problem_domain') or '未识别业务域'
+        checklist = comment_insights.get('diagnosis_checklist') or []
+        top = historical_cases[0]
+        resolution_counts = {}
+        domain_counts = {}
+        for case in historical_cases:
+            case_resolution = case.get('resolution_action') or '未明确'
+            case_domain = case.get('problem_domain') or '未识别'
+            resolution_counts[case_resolution] = resolution_counts.get(case_resolution, 0) + 1
+            domain_counts[case_domain] = domain_counts.get(case_domain, 0) + 1
+        resolution_summary = '、'.join(
+            f"{key}{value}个"
+            for key, value in sorted(resolution_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+        )
+        domain_summary = '、'.join(
+            f"{key}{value}个"
+            for key, value in sorted(domain_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+        )
 
         return {
             'id': 'comment_insight',
-            'category': category,
+            'category': f"历史案例参考 - {problem_domain}",
             'analysis': (
-                f"测试备注识别到的处理结论：{resolution}；是否真实缺陷：{bug_text}。"
-                f"末条备注：{final_comment[:240]}。{similar_text}"
+                f"命中 {len(historical_cases)} 个相似历史问题，业务域分布：{domain_summary or '未识别'}；"
+                f"历史处理动作分布：{resolution_summary or '未明确'}。"
+                f"最相似案例为 {top.get('issue_key')}「{top.get('summary')}」。"
             ),
-            'suggestion': '优先核对测试备注中的最终结论、数据订正或第三方/权限说明，再决定是否继续做代码排查。',
+            'suggestion': '；'.join(checklist[:3]) if checklist else '优先核对业务对象、数据状态、配置规则和第三方状态，再决定是否继续做代码排查。',
             'confidence': 0.88 if comment_insights.get('has_comments') else 0.62,
             'comment_insights': comment_insights,
             'historical_cases': historical_cases[:3]
@@ -1805,6 +1915,57 @@ class JiraAnalyzer:
         ) or self._has_zero_signal(evidence_text)
         has_assessor_distribution = '评估师' in evidence_text and '分配' in evidence_text
         has_explicit_missing_intention = '不存在在途的卖车意向' in evidence_text
+        trace_data = code_context.get('trace_data') or {}
+        trace_error_text = ' '.join(
+            str(node.get('error_text') or '')
+            for node in trace_data.get('error_nodes') or []
+        )
+        has_parameter_error = '参数错误' in trace_error_text or '参数错误' in evidence_text
+        has_param_validation = any(
+            hint.get('category') == '参数校验'
+            for item in evidence
+            for hint in item.get('hints') or []
+        )
+        has_permission_validation = any(
+            hint.get('category') == '权限校验'
+            for item in evidence
+            for hint in item.get('hints') or []
+        )
+        has_explicit_exception = any(
+            hint.get('category') == '显式异常'
+            for item in evidence
+            for hint in item.get('hints') or []
+        )
+
+        if has_parameter_error and has_param_validation:
+            return {
+                'category': '入参校验失败',
+                'analysis': (
+                    "Trace 异常显示“参数错误”，代码入口方法中存在明确的参数验空/参数校验逻辑；"
+                    "因此优先怀疑调用方传入的必填参数为空或格式不符合预期，而不是实现类没有找到。"
+                ),
+                'suggestions': [
+                    "核对 Dubbo 入参 orgId、buttonCode、operator、businessTypeCode 是否为空或传错。",
+                    "重点查看入口方法中的 ValidateUtil.validateStringParamNull 调用，确认错误提示对应哪个字段。",
+                    "如果参数来自按钮配置或前端动作，继续核对 buttonCode、businessTypeCode 和 fieldValueList 的来源。"
+                ],
+                'confidence': 0.9
+            }
+
+        if has_permission_validation and has_explicit_exception:
+            return {
+                'category': '权限或业务校验失败',
+                'analysis': (
+                    "代码入口方法中存在权限校验和显式业务异常分支；"
+                    "如果 Trace 异常不是空指针/系统错误，应优先核对权限、按钮布局、字段值和业务规则校验结果。"
+                ),
+                'suggestions': [
+                    "核对 operator 在 orgId 下是否具备新增跟进对象权限。",
+                    "检查 buttonCode 对应按钮布局和必填字段配置是否完整。",
+                    "沿 validateButtonLayout、validateRepeat、EntityUtil.mapping 分支确认具体失败点。"
+                ],
+                'confidence': 0.82
+            }
 
         if has_sell_car_intention and (has_zero_result or has_explicit_missing_intention):
             action = '分配评估师' if has_assessor_distribution else '当前操作'

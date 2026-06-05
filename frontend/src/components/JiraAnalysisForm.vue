@@ -216,6 +216,7 @@ function handleAnalyze() {
         start: formatDateTime(formValue.value.startTime),
         end: formatDateTime(formValue.value.endTime)
       },
+      api_paths: interfaces,
       services,
       extra_clues: interfaces.join('\n'),
       use_ai: true
