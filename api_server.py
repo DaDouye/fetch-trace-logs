@@ -88,6 +88,13 @@ class AnalysisFeedbackRequest(BaseModel):
     predicted_causes: Optional[List[Dict[str, Any]]] = None
 
 
+class AnalyzeTraceRequest(BaseModel):
+    """链路 SQL 分析请求模型"""
+    trace_id: str                    # Trace ID (必填)
+    cookies: str                     # Trace API 认证 cookies (必填)
+    date: Optional[str] = None       # 可选，如 "2026-04-23"，不提供则从 trace_id 推断
+
+
 @app.get("/")
 async def root():
     """根路径"""
@@ -97,6 +104,7 @@ async def root():
         "endpoints": {
             "analyze": "POST /api/analyze",
             "analyze_jira": "POST /api/analyze-jira",
+            "analyze_trace": "POST /api/analyze-trace",
             "repos": "GET /api/repos"
         }
     }
@@ -237,6 +245,93 @@ async def analyze_jira(req: AnalyzeJiraRequest):
         raise HTTPException(status_code=404, detail=f"仓库不存在: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"JIRA 分析失败: {str(e)}")
+
+
+@app.post("/api/analyze-trace")
+async def analyze_trace(req: AnalyzeTraceRequest):
+    """
+    分析链路中的 SQL 语句
+
+    Request Body:
+    - trace_id: Trace ID (必填)
+    - cookies: Trace API 认证 cookies (必填)
+    - date: (可选) 日期，不提供则从 trace_id 推断
+    """
+    try:
+        from scripts.fetch_trace_souche import TraceFetcher
+        from datetime import timezone, timedelta
+        import re
+
+        # 推断日期
+        date = req.date
+        if not date:
+            match = re.match(r'^(\d{13})_', req.trace_id or '')
+            if match:
+                try:
+                    ts = int(match.group(1)) / 1000
+                    date = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="未提供日期，且无法从 Trace ID 推断日期。请填写日期（YYYY-MM-DD）"
+            )
+
+        verify_ssl = os.getenv("TRACE_VERIFY_SSL", "false").lower() == "true"
+        fetcher = TraceFetcher(cookies=req.cookies, verify_ssl=verify_ssl)
+        trace_data = fetcher.fetch_trace(req.trace_id, date)
+
+        if not trace_data:
+            return {"sql_list": [], "trace_id": req.trace_id, "message": "未获取到 Trace 数据"}
+
+        if trace_data.get('error'):
+            return {"sql_list": [], "trace_id": req.trace_id, "error": trace_data['error']}
+
+        # 提取 SQL 数据
+        sql_entries = TraceFetcher.extract_sql_data(trace_data)
+
+        sql_list = []
+        seen = set()
+
+        for entry in sql_entries[:20]:  # 最多处理20条
+            rid = entry.get('rid')
+            sql_text = None
+
+            # 尝试获取详细 SQL（复用现有逻辑）
+            if rid:
+                try:
+                    detail = fetcher.fetch_sql_detail(rid)
+                    sql_text = fetcher.format_complete_sql(detail)
+                except Exception:
+                    sql_text = None
+
+            # 如果没拿到详细 SQL，尝试从 entry 本身获取
+            if not sql_text:
+                raw_sql = entry.get('sql') or entry.get('path') or entry.get('statement')
+                if raw_sql:
+                    sql_text = ' '.join(str(raw_sql).split())
+
+            if not sql_text or sql_text in seen:
+                continue
+
+            seen.add(sql_text)
+            sql_list.append({
+                "rid": rid,
+                "service_name": entry.get('app') or entry.get('serviceName') or 'Unknown',
+                "duration_ms": entry.get('cost') or entry.get('duration') or 0,
+                "sql": sql_text,
+                "is_batch": entry.get('is_batch', False),
+                "result_size": entry.get('size', 0)
+            })
+
+        return {"sql_list": sql_list, "trace_id": req.trace_id, "total": len(sql_list)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"链路 SQL 分析失败: {str(e)}")
 
 
 @app.post("/api/analysis-feedback")
