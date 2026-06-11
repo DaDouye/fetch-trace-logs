@@ -320,45 +320,45 @@ class JavaCallChainAnalyzer:
 
     def _find_controller_method_local(self, api_path: str) -> Optional[Tuple[str, str, str, int]]:
         """本地模式：查找 Controller 方法"""
-        json_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/json')
-        if not os.path.exists(json_dir):
-            return None
-
-        REST_ANNOTATION_PATTERN = re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL)
-
-        for root, dirs, files in os.walk(json_dir):
-            for file in files:
-                if not file.endswith('.java'):
-                    continue
-
-                file_path = os.path.join(root, file)
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-
-                result = self._extract_controller_from_content(content, file_path, api_path)
-                if result:
-                    self._controller_cache[api_path] = result
-                    return result
+        # 不再硬编码包路径，先搜旧项目路径，再搜整个 web/src/main/java 作为兜底
+        search_roots = [
+            os.path.join(self.web_src_path, 'com/jiaxuan/supermario/json'),  # 兼容旧项目
+            self.web_src_path,  # 通用回退
+        ]
+        for search_root in search_roots:
+            if not os.path.exists(search_root):
+                continue
+            for root, dirs, files in os.walk(search_root):
+                for file in files:
+                    if not file.endswith('.java'):
+                        continue
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+                    result = self._extract_controller_from_content(content, file_path, api_path)
+                    if result:
+                        self._controller_cache[api_path] = result
+                        return result
 
         return None
 
     def _find_controller_method_remote(self, api_path: str) -> Optional[Tuple[str, str, str, int]]:
         """远程模式：查找 Controller 方法"""
-        json_dir = 'web/src/main/java/com/jiaxuan/supermario/json'
-        files = self._git_fetcher.list_files(json_dir)
-        if not files:
+        # 不再硬编码包路径
+        java_dir = 'web/src/main/java'
+        all_files = self._git_fetcher.list_files(java_dir)
+        if not all_files:
             return None
 
-        REST_ANNOTATION_PATTERN = re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL)
-
-        for file_rel_path in files:
+        for file_rel_path in all_files:
             if not file_rel_path.endswith('.java'):
                 continue
-
             content = self._read_file(file_rel_path)
             if not content:
                 continue
-
             result = self._extract_controller_from_content(content, file_rel_path, api_path)
             if result:
                 self._controller_cache[api_path] = result
@@ -372,42 +372,88 @@ class JavaCallChainAnalyzer:
         file_path: str,
         api_path: str
     ) -> Optional[Tuple[str, str, str, int]]:
-        """从文件内容中提取 Controller 信息"""
+        """从文件内容中提取 Controller 信息，支持 @Rest 和标准 Spring MVC 注解"""
         class_match = re.search(r'public\s+class\s+(\w+)', content)
         if not class_match:
             return None
         class_name = class_match.group(1)
 
-        pkg_match = re.search(r'package\s+([\w\.]+)\s*;', content)
-        package_prefix = ''
-        if pkg_match:
-            pkg = pkg_match.group(1)
-            for part in pkg.split('.'):
-                if part in ['v1', 'v2', 'v3', 'crm', 'ai', 'admin']:
-                    package_prefix = part
-                    break
+        # 提取类级别的基础路径
+        class_base_path = self._extract_class_base_path(content)
+        target = api_path.strip('/')
 
-        api_match = re.search(r'@Api\s*\(\s*value\s*=\s*["\']([^"\']+)["\']', content)
-        api_value = api_match.group(1) if api_match else class_name
+        # 1. 先尝试自定义 @Rest 注解（支持 @Rest("/path") 和 @Rest(value = "/path") 两种格式）
+        REST_ANNOTATION_PATTERNS = [
+            re.compile(r'@Rest\s*\(\s*["\']([^"\']+)["\']'),           # @Rest("/path")
+            re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL),  # @Rest(value="/path")
+        ]
+        matched_rest = False
+        for pattern in REST_ANNOTATION_PATTERNS:
+            for match in pattern.finditer(content):
+                rest_path = match.group(1).strip('/')
+                pkg_match = re.search(r'package\s+([\w\.]+)\s*;', content)
+                pkg = pkg_match.group(1) if pkg_match else ''
+                api_match = re.search(r'@Api\s*\(\s*value\s*=\s*["\']([^"\']+)["\']', content)
+                api_value = api_match.group(1) if api_match else class_name
+                package_prefix = ''
+                for part in pkg.split('.'):
+                    if part in ['v1', 'v2', 'v3', 'crm', 'ai', 'admin']:
+                        package_prefix = part
+                        break
+                possible_paths = [
+                    f"{package_prefix}/{api_value}/{rest_path}" if package_prefix else f"{api_value}/{rest_path}",
+                    rest_path,
+                ]
+                for full_path in possible_paths:
+                    if self._match_api_path(full_path, target):
+                        method_name = self._find_method_for_annotation(content, match.start())
+                        line_number = content[:match.start()].count('\n') + 1
+                        return (class_name, method_name, file_path, line_number)
 
-        REST_ANNOTATION_PATTERN = re.compile(r'@Rest\s*\(\s*value\s*=\s*["\']([^"\']+)["\'].*?\)', re.DOTALL)
+        # 2. 标准 Spring MVC 注解：@RequestMapping, @GetMapping, @PostMapping, @PutMapping, @DeleteMapping
+        SPRING_MAPPING_PATTERN = re.compile(
+            r'@(?:Request|Get|Post|Put|Delete)Mapping'
+            r'\s*\(\s*(?:value|path)\s*=\s*["\']([^"\']+)["\']'
+        )
+        # 也支持简写形式 @GetMapping("/path")
+        SPRING_MAPPING_SHORT = re.compile(
+            r'@(?:Request|Get|Post|Put|Delete)Mapping\s*\(\s*["\']([^"\']+)["\']'
+        )
+        # @RequestMapping 也可能有 method 参数
+        SPRING_MAPPING_METHOD = re.compile(
+            r'@RequestMapping\s*\(\s*method\s*=\s*\w+\.\w+\s*,\s*(?:value|path)\s*=\s*["\']([^"\']+)["\']'
+        )
 
-        for match in REST_ANNOTATION_PATTERN.finditer(content):
-            rest_path = match.group(1).strip('/')
+        for pattern in [SPRING_MAPPING_METHOD, SPRING_MAPPING_PATTERN, SPRING_MAPPING_SHORT]:
+            for match in pattern.finditer(content):
+                method_path = match.group(1).strip('/')
+                # 组合类路径和方法路径
+                candidates = []
+                if class_base_path:
+                    candidates.append(f"{class_base_path}/{method_path}")
+                candidates.append(method_path)
 
-            possible_paths = [
-                f"/{package_prefix}/{api_value}/{rest_path}" if package_prefix else f"/{api_value}/{rest_path}",
-                f"/{rest_path}",
-            ]
-
-            for full_path in possible_paths:
-                if self._match_api_path(full_path, api_path):
-                    method_name = self._find_method_for_annotation(content, match.start())
-                    line_number = content[:match.start()].count('\n') + 1
-
-                    return (class_name, method_name, file_path, line_number)
+                for candidate in candidates:
+                    if self._match_api_path(candidate, target):
+                        method_name = self._find_method_for_annotation(content, match.start())
+                        line_number = content[:match.start()].count('\n') + 1
+                        return (class_name, method_name, file_path, line_number)
 
         return None
+
+    @staticmethod
+    def _extract_class_base_path(content: str) -> str:
+        """提取类级别的 @RequestMapping 基础路径"""
+        # @RequestMapping("/path") or @RequestMapping(value = "/path")
+        patterns = [
+            r'@RequestMapping\s*\(\s*["\']([^"\']+)["\']',  # @RequestMapping("/path")
+            r'@RequestMapping\s*\(\s*(?:value|path)\s*=\s*["\']([^"\']+)["\']',  # @RequestMapping(value = "/path")
+        ]
+        for p in patterns:
+            m = re.search(p, content)
+            if m:
+                return m.group(1).strip('/')
+        return ''
 
     def _match_api_path(self, found_path: str, target_path: str) -> bool:
         found = found_path.strip('/')
@@ -694,22 +740,19 @@ class JavaCallChainAnalyzer:
             impl_names.append(base_name + 'Impl.java')
 
         if self._use_remote:
-            # 远程模式：搜索文件
+            # 远程模式：全局搜索
             for impl_name in impl_names:
-                impl_path = self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/service/impl', impl_name)
+                impl_path = self._search_remote_file('web/src/main/java', impl_name)
                 if impl_path:
                     self._service_impl_cache[service_interface] = impl_path
                     return impl_path
         else:
-            # 本地模式
-            impl_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/service/impl')
-            if os.path.exists(impl_dir):
-                for root, dirs, files in os.walk(impl_dir):
-                    for file in files:
-                        if any(file.lower() == impl_name.lower() for impl_name in impl_names):
-                            impl_path = os.path.join(root, file)
-                            self._service_impl_cache[service_interface] = impl_path
-                            return impl_path
+            # 本地模式：不再硬编码包路径
+            for impl_name in impl_names:
+                impl_path = self._search_local_file(self.web_src_path, impl_name)
+                if impl_path:
+                    self._service_impl_cache[service_interface] = impl_path
+                    return impl_path
 
         return None
 
@@ -766,6 +809,17 @@ class JavaCallChainAnalyzer:
                     return file_path
         return None
 
+    def _search_local_file(self, search_root: str, filename: str) -> Optional[str]:
+        """在本地目录树中搜索文件（大小写不敏感）"""
+        if not os.path.exists(search_root):
+            return None
+        target_lower = filename.lower()
+        for root, dirs, files in os.walk(search_root):
+            for f in files:
+                if f.lower() == target_lower:
+                    return os.path.join(root, f)
+        return None
+
     def _search_remote_file(self, directory: str, filename: str) -> Optional[str]:
         """在远程仓库目录中搜索文件"""
         files = self._git_fetcher.list_files(directory)
@@ -808,14 +862,10 @@ class JavaCallChainAnalyzer:
         mapper_file = mapper_name + '.java'
 
         if self._use_remote:
-            return self._search_remote_file('web/src/main/java/com/jiaxuan/supermario/dao/mapper', mapper_file)
+            return self._search_remote_file('web/src/main/java', mapper_file)
         else:
-            mapper_dir = os.path.join(self.web_src_path, 'com/jiaxuan/supermario/dao/mapper')
-            if os.path.exists(mapper_dir):
-                for root, dirs, files in os.walk(mapper_dir):
-                    if mapper_file in files:
-                        return os.path.join(root, mapper_file)
-        return None
+            # 不再硬编码包路径，全局搜索
+            return self._search_local_file(self.web_src_path, mapper_file)
 
     def _get_sql_from_mapper(self, mapper_name: str, method_name: str) -> Optional[str]:
         """从 MyBatis XML 获取 SQL"""

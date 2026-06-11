@@ -611,6 +611,9 @@ class JiraAnalyzer:
         if enable_code_context and call_chain_paths:
             call_chain_result = self._analyze_call_chain(call_chain_paths)
             if call_chain_result:
+                if call_chain_result.get('error'):
+                    print(f"[CodeContext] Call chain FAILED: {call_chain_result.get('error')} "
+                          f"for paths: {call_chain_paths}")
                 context['call_chains'].append({
                     'api_path': call_chain_paths,  # all paths
                     'call_chain': call_chain_result
@@ -618,10 +621,126 @@ class JiraAnalyzer:
             print(f"[CodeContext] Call chains: {len(context['call_chains'])}")
 
         if enable_code_context:
+            # 收集调用链上的方法体（优先级最高）
+            context['method_snippets'] = self._collect_call_chain_method_snippets(
+                context.get('call_chains') or []
+            )
+            # 始终从搜索命中文件中补充代码片段，与调用链片段合并
+            if context.get('files'):
+                search_snippets = self._extract_snippets_from_search_results(context['files'])
+                existing_keys = {(s['file_path'], s['method_name']) for s in context['method_snippets']}
+                for s in search_snippets:
+                    if (s['file_path'], s['method_name']) not in existing_keys:
+                        context['method_snippets'].append(s)
+                        existing_keys.add((s['file_path'], s['method_name']))
             context['business_evidence'] = self._extract_business_evidence(context)
-            print(f"[CodeContext] Business evidence: {len(context['business_evidence'])}")
+            print(f"[CodeContext] Method snippets: {len(context['method_snippets'])}, Business evidence: {len(context['business_evidence'])}")
 
         return context
+
+    def _extract_snippets_from_search_results(self, files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """从代码搜索匹配结果中提取完整 Java 方法体，作为调用链方法体的兜底方案"""
+        snippets = []
+        seen = set()
+
+        for file_info in files[:10]:
+            file_path = file_info.get('file_path', '')
+            if not file_path or not os.path.exists(file_path):
+                continue
+
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    all_lines = f.readlines()
+            except Exception:
+                continue
+
+            # 从文件名推断类名
+            class_name = os.path.splitext(os.path.basename(file_path))[0]
+
+            for match in (file_info.get('matches') or [])[:2]:
+                match_line = match.get('line_number', 0)
+                if not match_line or match_line > len(all_lines):
+                    continue
+
+                # 从匹配行向上查找方法签名
+                method_name, method_start = self._find_enclosing_method(all_lines, match_line - 1)
+                if method_name and method_start >= 0:
+                    # 提取完整方法体
+                    body = self._extract_method_body(all_lines, method_start)
+                    key = (file_path, method_name)
+                else:
+                    # 找不到方法，扩大窗口到 ±50 行
+                    start = max(0, match_line - 51)
+                    end = min(len(all_lines), match_line + 50)
+                    body = ''.join(all_lines[start:end])
+                    method_name = f"near_line_{match_line}"
+                    key = (file_path, match_line)
+
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                body = body.strip()
+                if len(body) < 50:  # 跳过太短的片段
+                    continue
+
+                snippets.append({
+                    'file_path': file_path,
+                    'line_number': method_start + 1 if method_start >= 0 else match_line,
+                    'class_name': class_name,
+                    'method_name': method_name,
+                    'body': body
+                })
+
+        print(f"[MethodSnippets] Fallback extracted {len(snippets)} snippets from search results")
+        return snippets[:10]
+
+    @staticmethod
+    def _find_enclosing_method(lines: List[str], start_idx: int) -> tuple:
+        """从指定行向上查找包含它的 Java 方法签名，返回 (方法名, 方法起始行号)"""
+        # Java 方法签名模式: 修饰符 返回类型 方法名(参数) {
+        method_pattern = re.compile(
+            r'(?:public|private|protected|static|\s)*'  # 修饰符
+            r'\s+[\w<>\[\],\s]+\s+'                       # 返回类型
+            r'(\w+)\s*\([^)]*\)\s*(?:throws\s+[\w\s,]+)?\s*\{'  # 方法名(参数) throws... {
+        )
+
+        # 向上搜索最多 80 行
+        for i in range(start_idx, max(-1, start_idx - 80), -1):
+            line = lines[i].strip()
+            # 跳过注释和注解
+            if line.startswith('//') or line.startswith('*') or line.startswith('/*'):
+                continue
+            m = method_pattern.search(line)
+            if m:
+                return m.group(1), i
+
+        return None, -1
+
+    @staticmethod
+    def _extract_method_body(lines: List[str], start_line: int) -> str:
+        """从方法签名行开始提取完整方法体（匹配大括号）"""
+        body_lines = []
+        brace_count = 0
+        started = False
+
+        for i in range(start_line, min(len(lines), start_line + 300)):
+            line = lines[i]
+            if not started:
+                body_lines.append(line)
+                if '{' in line:
+                    started = True
+                    brace_count += line.count('{') - line.count('}')
+                    if brace_count == 0:
+                        break
+                continue
+
+            body_lines.append(line)
+            brace_count += line.count('{') - line.count('}')
+            if brace_count <= 0:
+                break
+
+        return ''.join(body_lines)
 
     @staticmethod
     def _format_trace_log_summary(trace_data: Optional[Dict[str, Any]]) -> str:
@@ -928,10 +1047,13 @@ class JiraAnalyzer:
 
         for item in call_chains:
             chain = item.get('call_chain') or {}
-            for node in self._flatten_call_chain_nodes(chain):
+            nodes = self._flatten_call_chain_nodes(chain)
+            print(f"[MethodSnippets] Call chain flattened to {len(nodes)} nodes")
+            for node in nodes:
                 file_path = node.get('file_path')
                 method_name = node.get('method_name')
                 if not file_path or file_path == 'Not found' or not method_name:
+                    print(f"[MethodSnippets] Skipping node - file_path={file_path}, method={method_name}, class={node.get('class_name')}")
                     continue
                 key = (file_path, method_name)
                 if key in seen:
@@ -939,6 +1061,7 @@ class JiraAnalyzer:
                 seen.add(key)
                 method_body = self._read_method_body(file_path, method_name, node.get('line_number') or 1)
                 if not method_body:
+                    print(f"[MethodSnippets] Failed to read body for {method_name} in {file_path}")
                     continue
                 snippets.append({
                     'file_path': file_path,
@@ -948,26 +1071,36 @@ class JiraAnalyzer:
                     'body': method_body
                 })
 
+        print(f"[MethodSnippets] Collected {len(snippets)} method snippets from call chains")
         return snippets
 
     def _flatten_call_chain_nodes(self, chain: Dict[str, Any]) -> List[Dict[str, Any]]:
         nodes = []
 
-        def visit(value):
+        def visit(value, depth=0):
             if isinstance(value, list):
                 for item in value:
-                    visit(item)
+                    visit(item, depth + 1)
                 return
             if not isinstance(value, dict):
                 return
             if value.get('class_name') or value.get('method_name'):
                 nodes.append(value)
             for child in value.get('children') or []:
-                visit(child)
+                visit(child, depth + 1)
             for child in value.get('call_chain') or []:
-                visit(child)
+                visit(child, depth + 1)
 
-        visit(chain.get('call_chain') if isinstance(chain, dict) and chain.get('call_chain') else chain)
+        entry = chain.get('call_chain') if isinstance(chain, dict) and chain.get('call_chain') else chain
+        print(f"[Flatten] Entry type: {type(entry).__name__}, "
+              f"is_list: {isinstance(entry, list)}, "
+              f"keys if dict: {list(entry.keys()) if isinstance(entry, dict) else 'N/A'}")
+        visit(entry)
+        print(f"[Flatten] Flattened to {len(nodes)} nodes")
+        if nodes:
+            for n in nodes[:3]:
+                print(f"[Flatten]   node: {n.get('class_name')}.{n.get('method_name')}() "
+                      f"file_path={n.get('file_path')} line={n.get('line_number')}")
         return nodes
 
     def _read_method_body(self, file_path: str, method_name: str, line_number: int) -> str:
@@ -1578,7 +1711,10 @@ class JiraAnalyzer:
                 if ai_causes:
                     for cause in ai_causes:
                         cause['source'] = 'ai'
-                    causes.extend(ai_causes)
+                    # AI 结果放在最前面
+                    causes = ai_causes + causes
+                    # 过滤掉规则引擎的「代码证据分析」兜底原因，AI 已经做了更深入的分析
+                    causes = [c for c in causes if c.get('id') != 'code_context_path']
                     ai_enhanced = True
                 else:
                     ai_enhanced = False
