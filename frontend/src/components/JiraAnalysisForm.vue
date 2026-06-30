@@ -150,8 +150,8 @@ const formValue = ref({
 const rules = {
   jiraUrl: { required: true, message: '请输入 JIRA 地址', trigger: 'input' },
   environment: { required: true, message: '请选择环境', trigger: 'change' },
-  startTime: { required: true, type: 'number', message: '请选择开始时间', trigger: 'change' },
-  endTime: { required: true, type: 'number', message: '请选择结束时间', trigger: 'change' }
+  startTime: { required: false, type: 'number', message: '请选择开始时间', trigger: 'change' },
+  endTime: { required: false, type: 'number', message: '请选择结束时间', trigger: 'change' }
 }
 
 const loading = computed(() => store.loading)

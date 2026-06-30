@@ -19,6 +19,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 load_dotenv()
 
 from api.analyze import JavaCallChainAnalyzer
+from api.analyzer.field_tracer import FieldTracer
 from config_manager import get_all_git_repos
 
 app = FastAPI(
@@ -95,6 +96,14 @@ class AnalyzeTraceRequest(BaseModel):
     date: Optional[str] = None       # 可选，如 "2026-04-23"，不提供则从 trace_id 推断
 
 
+class FieldAnalysisRequest(BaseModel):
+    """字段溯源分析请求模型"""
+    project_name: str                 # 项目名（必填）
+    api_path: Optional[str] = None    # 接口路径（与 method_name 至少填一个）
+    method_name: Optional[str] = None # Java 方法名（与 api_path 至少填一个）
+    field_path: Optional[str] = None  # 响应字段路径，如 "data.userId"
+
+
 @app.get("/")
 async def root():
     """根路径"""
@@ -105,6 +114,7 @@ async def root():
             "analyze": "POST /api/analyze",
             "analyze_jira": "POST /api/analyze-jira",
             "analyze_trace": "POST /api/analyze-trace",
+            "analysis": "POST /api/analysis",
             "repos": "GET /api/repos"
         }
     }
@@ -332,6 +342,47 @@ async def analyze_trace(req: AnalyzeTraceRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"链路 SQL 分析失败: {str(e)}")
+
+
+@app.post("/api/analysis")
+async def analyze_field(req: FieldAnalysisRequest):
+    """
+    字段溯源分析：根据项目名、接口路径（或方法名）、响应字段路径，
+    追溯该字段的完整实现逻辑（JSON路径 → DTO → Service → Entity → DB → SQL）
+
+    Request Body:
+    - project_name: 项目名（必填）
+    - api_path: 接口路径（与 method_name 至少填一个）
+    - method_name: Java 方法名（与 api_path 至少填一个）
+    - field_path: 响应字段 JSON 路径，如 "data.userId" 或 "data.list[0].name"
+    """
+    # 参数校验
+    if not req.project_name or not req.project_name.strip():
+        raise HTTPException(status_code=400, detail="project_name 为必填参数")
+    if not req.api_path and not req.method_name:
+        raise HTTPException(status_code=400, detail="api_path 或 method_name 至少需要提供一个")
+    if not req.field_path or not req.field_path.strip():
+        raise HTTPException(status_code=400, detail="field_path 为必填参数")
+
+    try:
+        tracer = FieldTracer(repo_key=req.project_name.strip())
+        result = tracer.trace(
+            api_path=req.api_path.strip() if req.api_path else None,
+            method_name=req.method_name.strip() if req.method_name else None,
+            field_path=req.field_path.strip()
+        )
+        if result.get('error') and not result.get('_partial'):
+            raise HTTPException(status_code=404, detail=result['error'])
+        return result
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"项目不存在: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"字段溯源分析失败: {str(e)}")
 
 
 @app.post("/api/analysis-feedback")

@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import JiraAnalysisPage from '../pages/JiraAnalysisPage.vue'
 import TraceAnalysisPage from '../pages/TraceAnalysisPage.vue'
+import FieldAnalysisPage from '../pages/FieldAnalysisPage.vue'
 
 const routes = [
   {
@@ -16,6 +17,11 @@ const routes = [
     path: '/jira-analysis',
     name: 'JiraAnalysis',
     component: JiraAnalysisPage
+  },
+  {
+    path: '/api-analysis',
+    name: 'FieldAnalysis',
+    component: FieldAnalysisPage
   }
 ]
 

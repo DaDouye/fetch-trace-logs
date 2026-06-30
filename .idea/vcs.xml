@@ -2,6 +2,8 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/ai-scrm-mac-mix-ddbd398c" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/glorious-mission-master-675daab1" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/repos/super-mario-master-2233f7bc" vcs="Git" />
   </component>
 </project>
